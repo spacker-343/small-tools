@@ -1,0 +1,20 @@
+# Credentials and local settings
+.env*
+*.key
+*.pem
+*.pfx
+*.p12
+.vscode/
+.idea/
+.vs/
+
+# Generated and temporary files
+*.dll
+*.exe
+*.pdb
+*.log
+*.tmp
+bin/
+obj/
+Thumbs.db
+Desktop.ini
