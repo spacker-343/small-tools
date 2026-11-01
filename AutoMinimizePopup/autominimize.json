@@ -1,0 +1,57 @@
+﻿// autominimize.json —— AutoMinimizeWorker.exe（以及兜底的 AutoMinimizeConsole.ps1）的配置。
+// 支持整行 // 注释（脚本读的时候会先剔除）。注意 JSON 本身不要留多余的逗号。
+// 改完保存后，重新跑一次 Install-AutoMinimize.ps1 即可生效（它会重启后台实例）。
+{
+  // 兜底扫描间隔，毫秒。正常情况下新窗口一出现，系统的事件回调就把我们叫醒，几乎瞬时；
+  // 这个值只是"万一事件没收到"的保险周期。500 足够，且几乎不占 CPU。
+  // 如果事件钩子装不上（日志里会写"仅靠兜底扫描"），把这个值调小到 200~500 来降低最大延迟。
+  "IntervalMs": 1500,
+
+  // 只处理这些窗口类。ConsoleWindowClass = 经典 conhost 黑框（cmd / bat / 脚本弹框）。
+  // Windows Terminal、VS Code 内嵌终端是别的窗口类，不会被动到。
+  // 想知道某个黑框的窗口类名，跑 Test-Popup.ps1 -List。
+  "IncludeClasses": ["ConsoleWindowClass"],
+
+  // 标题正则（不区分大小写），命中任意一条才认定是"临时弹框"。
+  // 想加新的弹框样式，就往这个数组里追加一条正则。
+  "TitlePatterns": [
+    "^C\\:\\\\WINDOWS\\\\system32\\\\cmd\\.exe$",
+    "^C\\:\\\\WINDOWS\\\\SysWow64\\\\cmd\\.exe$",
+    "^(Administrator: )?(命令提示符|Command Prompt)$",
+    "^[A-Za-z]:\\\\.*\\\\(cmd|conhost|cscript|wscript|mshta)\\.exe( .*)?$",
+    "^[A-Za-z]:\\\\.*\\.(bat|cmd)$"
+  ],
+
+  // 命中了 TitlePatterns、但同时命中这条正则的窗口，放过。
+  // 例子：你自己有个常驻终端标题里带 "MINE"，就写 "MINE"。留空表示不启用。
+  "WhitelistTitlePattern": "",
+
+  // 进程名（不带 .exe，不区分大小写）黑名单：这些进程拥有的窗口一律不动。
+  "ExcludeProcessNames": ["WindowsTerminal", "Code", "Cursor", "wt"],
+
+  // true = 脚本启动时已经开着的窗口永远不碰（只处理之后新弹出来的）。
+  "IgnoreExistingWindows": true,
+
+  // true = 每个窗口只自动最小化一次。你手动点回来后，脚本不会再抢着最小化它。
+  // false = 只要它还命中规则且没最小化，就一直按下去（不推荐，会跟你抢窗口）。
+  "MinimizeOnceOnly": true,
+
+  // true = 最小化后把焦点还给黑框抢走之前的那个窗口。
+  "RestoreFocus": true,
+
+  // true = 在创建事件中也检查已经可见且匹配规则的窗口。
+  // 原本隐藏的窗口不处理，防止最小化操作反而将后台窗口显示出来；尚未显示的等 SHOW 事件。
+  "MinimizeOnCreate": true,
+
+  // true = 收起的同时把窗口从任务栏和 Alt+Tab 里摘掉（加 WS_EX_TOOLWINDOW）。
+  // 只是"不露脸"，进程照跑、输出照写、管道照读，程序功能不受影响。
+  // 临时想看某个黑框：跑 AutoMinimizeWorker.exe /reveal，把它们放回任务栏并还原。
+  "HideFromTaskbar": true,
+
+  // true = 日志里额外记录弹框进程的命令行和父进程，方便你查出是谁在弹这些黑框。
+  // 关掉它可省掉每次一次进程查询（性能差别很小，一般建议留着）。
+  "LogPopupSource": true,
+
+  // 日志：'' = 脚本同目录 autominimize.log ；'none' = 不写；也可以写绝对路径。
+  "LogFile": ""
+}

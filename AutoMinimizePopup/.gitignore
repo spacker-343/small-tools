@@ -1,0 +1,21 @@
+# 运行期产物
+autominimize.log
+autominimize.pid
+console-windows.txt
+*.log
+*.pid
+
+# 临时编译校验产物
+build-check.exe
+PopupSourceMonitor.exe
+
+# Windows
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+
+# 编辑器
+.vs/
+.vscode/
+.idea/
+*.swp
