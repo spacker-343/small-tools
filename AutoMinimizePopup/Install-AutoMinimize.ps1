@@ -89,6 +89,48 @@ function Stop-Worker {
     else { Write-Host ("已停止后台实例 {0}。" -f ($ids -join ',')) }
 }
 
+# 商店版终端可能把 AppData 写入重定向到包私有目录；计划任务不继承该视图。
+# 注册任务前解析实际目录，让任务、重装和卸载都使用同一个物理位置。
+if (-not $Uninstall -and -not (Test-Path -LiteralPath $InstallDir)) {
+    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+}
+if (-not ('AutoMinimizeInstallPath' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public static class AutoMinimizeInstallPath {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern SafeFileHandle CreateFile(string path, uint access, uint share,
+        IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern uint GetFinalPathNameByHandle(SafeFileHandle handle,
+        StringBuilder path, uint size, uint flags);
+    public static string Resolve(string directory) {
+        using (var handle = CreateFile(directory, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+            if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+            var path = new StringBuilder(32768);
+            uint length = GetFinalPathNameByHandle(handle, path, (uint)path.Capacity, 0);
+            if (length == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (length >= path.Capacity) throw new PathTooLongException(directory);
+            string result = path.ToString();
+            if (result.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) return @"\\" + result.Substring(8);
+            if (result.StartsWith(@"\\?\", StringComparison.Ordinal)) return result.Substring(4);
+            return result;
+        }
+    }
+}
+'@
+}
+$scriptDir = [AutoMinimizeInstallPath]::Resolve($scriptDir)
+if (Test-Path -LiteralPath $InstallDir -PathType Container) {
+    $InstallDir = [AutoMinimizeInstallPath]::Resolve(
+        $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InstallDir))
+}
+
 if ($Uninstall) {
     Write-Host "== 卸载 $TaskName =="
      Stop-Worker
@@ -131,9 +173,6 @@ Write-Host "源目录  : $scriptDir"
 Write-Host "安装目录: $InstallDir"
 
 # ---------------------------------------------------------------- 复制文件
-if (-not (Test-Path -LiteralPath $InstallDir)) {
-    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-}
 $installed = @()
 foreach ($f in $files) {
     $src = Join-Path $scriptDir $f
