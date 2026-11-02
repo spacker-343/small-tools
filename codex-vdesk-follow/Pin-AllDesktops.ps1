@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-  [ValidateSet('codex','ticktick','both','custom')][string]$Target = 'codex',
+  [ValidateSet('codex','ticktick','feishu','both','all','custom')][string]$Target = 'codex',
   [string]$AppId,
   [string]$ProcessMatch,
   [switch]$Unpin,
@@ -13,7 +13,7 @@ $results = @()
 $errors = @()
 try { if ($PSVersionTable.PSEdition -eq 'Core') { throw 'Use Windows PowerShell 5.1; PowerShell Core does not support this COM interface.' }
   if ($Status -and $Unpin) { throw 'Status and Unpin cannot be combined.' }
-  if ($AppId -and $Target -eq 'both') { throw 'AppId requires a single target.' }
+  if ($AppId -and $Target -in @('both','all')) { throw 'AppId requires a single target.' }
   if (-not ('VDeskInterop' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'VDeskInterop.cs') }
   if ($AppId) {
     $r = [VDeskInterop]::Run(0, $AppId, $mode)
@@ -23,7 +23,9 @@ try { if ($PSVersionTable.PSEdition -eq 'Core') { throw 'Use Windows PowerShell 
     $patterns = switch ($Target) {
       'codex' { @{ codex='^(ChatGPT|Codex)$' } }
       'ticktick' { @{ ticktick='^(TickTick|dida)$' } }
+      'feishu' { @{ feishu='^Feishu$' } }
       'both' { @{ codex='^(ChatGPT|Codex)$'; ticktick='^(TickTick|dida)$' } }
+      'all' { @{ codex='^(ChatGPT|Codex)$'; ticktick='^(TickTick|dida)$'; feishu='^Feishu$' } }
       'custom' { @{ custom=$ProcessMatch } }
     }
     if ($ProcessMatch -and $Target -ne 'custom') { throw 'ProcessMatch requires target custom.' }
@@ -38,6 +40,9 @@ try { if ($PSVersionTable.PSEdition -eq 'Core') { throw 'Use Windows PowerShell 
           $targetProcess = Get-Process -Id $w.ProcessId -ErrorAction Stop
           $identityOk = if ($name -eq 'codex') {
             $r.AppId -eq 'OpenAI.Codex_2p2nqsd0c76g0!App' -and $targetProcess.Path -match '\\WindowsApps\\OpenAI\.Codex_[^\\]+\\app\\ChatGPT\.exe$'
+          } elseif ($name -eq 'feishu') {
+            $expectedPath = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Feishu\app\Feishu.exe'
+            $r.AppId -eq 'com.electron.Feishu' -and $targetProcess.Path -eq $expectedPath
           } else {
             $expectedPath = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) '滴答清单\TickTick.exe'
             $r.AppId -eq '{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}\滴答清单\TickTick.exe' -and $targetProcess.Path -eq $expectedPath
@@ -54,3 +59,4 @@ $ok = $errors.Count -eq 0 -and $results.Count -gt 0 -and @($results | Where-Obje
 $output = [pscustomobject]@{ Mode=$mode; Success=$ok; Errors=@($errors); Windows=@($results) }
 if ($Json) { $output | ConvertTo-Json -Depth 6 } else { $output | Format-List | Out-String | Write-Host; foreach ($item in $results) { $item | Format-List Target,ProcessName,ProcessId,Hwnd,Title | Out-String | Write-Host; $item.Result | Format-List | Out-String | Write-Host } }
 if (-not $ok) { exit 1 }
+exit 0
