@@ -60,6 +60,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-AutoMinimize.ps1
 
 管理员账户下计划任务默认 `RunLevel=Highest`（登录时**不会再弹 UAC**）；想退回受限权限加 `-LimitedWorker`。
 
+从商店版 Codex 等打包应用里安装时，Windows 可能将 `%LOCALAPPDATA%` 重定向到应用的私有目录。安装器会解析实际目录并用它注册计划任务，避免任务报 `0x80070002`（找不到文件）。以安装输出的“安装目录”和计划任务的程序路径为准；同一应用内重装、卸载会解析到相同位置，从其他终端卸载时可用 `-InstallDir` 指定该实际目录。
+
 ## 卸载
 
 ```powershell
@@ -89,6 +91,8 @@ powershell -NoProfile -File .\Test-HiddenWindowRegression.ps1
 ```
 
 测试使用独立窗口类、独立常驻实例和离屏窗口，检查隐藏窗口、自动收起、已有窗口、白名单、不匹配窗口和手动还原六项行为。
+
+`Test-Popup.ps1` 会显式启动两个经典 conhost 控制台，即使系统默认终端为 Windows Terminal，也能验证本工具实际处理的窗口。测试只核对本次创建的窗口；两个窗口都确认最小化才通过，窗口提前退出、缺失或未收起均以非零状态退出。
 
 ## 黑窗来源监控
 

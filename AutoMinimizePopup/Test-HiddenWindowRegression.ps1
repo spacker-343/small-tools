@@ -67,7 +67,7 @@ try {
         [HiddenRegression]::Pump()
         Start-Sleep -Milliseconds 40
         $log = Join-Path $testDirectory 'autominimize.log'
-        $started = (Test-Path -LiteralPath $log) -and ((Get-Content -LiteralPath $log -Raw) -match '事件钩子已挂载')
+        $started = (Test-Path -LiteralPath $log) -and ((Get-Content -LiteralPath $log -Raw -Encoding UTF8) -match '事件钩子已挂载')
     } while (-not $started -and $ready.ElapsedMilliseconds -lt 3000)
     if (-not $started) { throw 'Regression worker failed to start' }
     $hiddenMatch = [HiddenRegression]::Create($class,'match hidden')

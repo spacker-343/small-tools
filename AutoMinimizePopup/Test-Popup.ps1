@@ -73,8 +73,8 @@ public static class NativeWin {
 }
 
 function Get-ConsoleWindows {
-    # 所有窗口类含 "onsole" 的顶层窗口（经典 conhost 黑框）。
-    return @(([NativeWin]::TopWindows()) | Where-Object { $_.ClassName -match 'onsole' })
+    # 只检查工具实际处理的经典控制台，不把 Terminal 的伪控制台算作弹框。
+    return @(([NativeWin]::TopWindows()) | Where-Object { $_.ClassName -eq 'ConsoleWindowClass' })
 }
 
 if ($List) {
@@ -101,6 +101,7 @@ if (Test-Path -LiteralPath $pidFile) {
         if ([int]::TryParse("$line".Trim(), [ref]$id) -and $id -ne $PID -and (Get-Process -Id $id -ErrorAction SilentlyContinue)) { $alive += $id }
     }
 }
+$alive += @(Get-Process -Name 'AutoMinimizeWorker' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
 if (-not $alive.Count) {
     $alive = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match '-File "?[^"]*AutoMinimizeConsole\.ps1"?\s*$' } |
@@ -110,27 +111,30 @@ $alive = @($alive | Select-Object -Unique)
 if ($alive.Count) {
     Write-Host ("后台实例在跑: pid={0}" -f ($alive -join ','))
 } else {
-    Write-Warning '没检测到 AutoMinimizeConsole.ps1 后台实例 —— 先跑 Install-AutoMinimize.ps1，或手动启动它。下面继续测试。'
+    Write-Warning '没检测到自动收起后台实例 —— 先跑 Install-AutoMinimize.ps1。下面继续测试。'
 }
 
-$before = @{}
-foreach ($w in Get-ConsoleWindows) { $before[$w.Hwnd] = $true }
-
-# 造两种典型弹框：cmd 直开、bat 脚本
+# 显式使用 conhost，避免默认终端为 Windows Terminal 时测到错误的窗口类。
+$conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
+$cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
+$identity = [guid]::NewGuid().ToString('N')
+$cmdTitle = "$cmd AutoMinimizeTest_$identity"
+$batTitle = "$cmd AutoMinimizeBatchTest_$identity"
 $bat = Join-Path $env:TEMP ("amtest_{0}.bat" -f (Get-Random))
-Set-Content -LiteralPath $bat -Value "@echo off`r`nping -n $([int]($Keep / 2)) 127.0.0.1 >nul`r`ndel `"%~f0`"" -Encoding ASCII
+Set-Content -LiteralPath $bat -Value "@echo off`r`ntitle $batTitle`r`nping -n $Keep 127.0.0.1 >nul`r`ndel `"%~f0`"" -Encoding ASCII
 
 Write-Host "弹出 2 个测试黑框（存活约 $Keep 秒）..."
-Start-Process cmd.exe -ArgumentList '/c', "ping -n $Keep 127.0.0.1 >nul & exit"
+Start-Process -FilePath $conhost -ArgumentList ('"{0}" /d /c "title {1}& ping -n {2} 127.0.0.1 >nul & exit"' -f $cmd, $cmdTitle, $Keep)
 Start-Sleep -Milliseconds 400
-Start-Process $bat
+Start-Process -FilePath $conhost -ArgumentList ('"{0}" /d /c ""{1}""' -f $cmd, $bat)
 
 Start-Sleep -Seconds 3
-$after = Get-ConsoleWindows | Where-Object { -not $before.ContainsKey($_.Hwnd) }
+$after = @(Get-ConsoleWindows | Where-Object { $_.Title.TrimEnd() -in @($cmdTitle, $batTitle) })
 
 if (-not $after) {
-    Write-Host '没抓到新弹框（可能已经退出），把 -Keep 调大再试。'
-    return
+    Write-Host '验证失败：没抓到测试弹框（可能已经退出），把 -Keep 调大再试。'
+    try { Remove-Item -LiteralPath $bat -Force -ErrorAction SilentlyContinue } catch { }
+    exit 1
 }
 
 $targets = @()
@@ -153,10 +157,11 @@ foreach ($t in $after) {
 }
 $targets | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
 
-$bad = @($targets | Where-Object { $_.结果 -like '*检查规则*' })
-if ($bad.Count -eq 0) {
-    Write-Host '结论: 通过 —— 新弹框都被自动最小化了。'
+$bad = @($targets | Where-Object { $_.结果 -notlike '已自动最小化*' })
+if ($bad.Count -eq 0 -and $targets.Count -eq 2) {
+    Write-Host '结论: 通过 —— 两个测试弹框都被自动最小化了。'
 } else {
-    Write-Host '结论: 有漏网的。把上面标题/类名加进 autominimize.json 的 TitlePatterns 或 IncludeClasses，再重装一次。'
+    Write-Host '结论: 验证失败 —— 未确认两个测试弹框都被自动最小化。请检查后台实例、规则或测试窗口存活时间。'
 }
 try { Remove-Item -LiteralPath $bat -Force -ErrorAction SilentlyContinue } catch { }
+if ($bad.Count -gt 0 -or $targets.Count -ne 2) { exit 1 }
