@@ -20,13 +20,20 @@ def replace_once(source, before, after):
 
 
 def patch_renderer(source):
-    # Enable the shipped feature only where the local desktop preload is present.
-    # The native renderer still decides which replies and workspaces support Fork.
+    # Keep the native checks for a valid historical step and supported workspace.
+    desktop = 'typeof window.dialog?.showOpenDialog==="function"'
+    enabled = f"conversationForkingEnabled:{desktop},conversationForkingNewWorktree:"
+    # The initial release may already be installed.
+    if enabled not in source:
+        source = replace_once(
+            source,
+            "conversationForkingEnabled:!1,conversationForkingNewWorktree:",
+            enabled,
+        )
     return replace_once(
         source,
-        'conversationForkingEnabled:!1,conversationForkingNewWorktree:',
-        'conversationForkingEnabled:typeof window.dialog?.showOpenDialog==="function",'
-        'conversationForkingNewWorktree:',
+        "conversationForkingHistoricalStep:!1,",
+        f"conversationForkingHistoricalStep:{desktop},",
     )
 
 
@@ -93,7 +100,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     default = Path(os.environ["LOCALAPPDATA"]) / "Programs" / "antigravity"
     parser.add_argument("--install", type=Path, default=default)
-    parser.add_argument("--output", type=Path, default=Path(__file__).parent / "build" / "language_server-native-fork.exe")
+    parser.add_argument("--output", type=Path, default=Path(__file__).parent / "build" / "language_server-native-fork-history.exe")
     args = parser.parse_args()
     try:
         build(args.install, args.output)
