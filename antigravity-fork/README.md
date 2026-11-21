@@ -1,6 +1,6 @@
 # Antigravity 原生 Fork 入口
 
-适配 Antigravity 桌面版 **2.33.0**。候选补丁只在本地桌面端打开内置 Fork 和历史回复 Fork 开关。图标出现在 Antigravity 原本的回复工具栏位置。菜单、历史切点、工作区判断、派生请求和跳转全部由原版实现处理。
+跨版本自适应补丁工具，用于在 Antigravity 桌面端打开内置 Fork 与历史回复 Fork 开关。图标出现在 Antigravity 原生回复工具栏位置，菜单、历史切点、工作区判断、派生请求和跳转全部由原版实现处理。
 
 | 操作 | 原生入口版 | 上一版独立目录补丁 |
 | --- | --- | --- |
@@ -10,14 +10,39 @@
 
 普通 Windows 文件夹不会从原生菜单获得任意本地目录选择。此版本只恢复原有入口和行为。[Google 官方布局与工作区说明](https://antigravity.google/docs/settings#interface-layout)
 
-## 构建与安装
+## 升级后一键恢复 / 安装（推荐）
 
-在项目目录使用 Python 3.10 或更新版运行以下命令。
+Antigravity 每次升级都会覆盖 `resources\bin\language_server.exe`。现在无需手动改版本号或手动备份/复制文件：
+
+1. **完全退出 Antigravity**（确保没有残留的 `Antigravity.exe` 或 `language_server.exe` 进程）。
+2. 在项目目录运行一键命令（或直接运行 `.\apply_fork.ps1`）：
+
+```powershell
+python .\fork_toolbar.py --apply
+```
+
+脚本会自动完成：
+- 从 `resources\app.asar` 自动识别当前安装的 Antigravity 版本（不再写死版本号）；
+- 自动将当前版本的原版 `language_server.exe` 备份到 `build\backups\language_server-<version>-official.exe`（若已是补丁版则不会覆盖原版备份）；
+- 正则匹配并开启 `conversationForkingEnabled` 与 `conversationForkingHistoricalStep`，保持内嵌 ZIP 与二进制体积完全一致后原子替换生效；
+- 如果未来某个新版本官方已经原生开启这两个开关，脚本会直接提示你无需再打补丁。
+
+## 其他命令
+
+仅构建候选文件（不修改安装目录）：
 
 ```powershell
 python .\fork_toolbar.py
 ```
 
-输出为 `build\language_server-native-fork-history.exe`。可以用 `--install` 指定安装根目录，用 `--output` 指定新的输出路径。构建脚本检查版本和替换位置。候选文件生成在安装目录以外。
+恢复当前版本的官方原版：
 
-候选文件是本地构建的非官方改版。安装需要先退出 Antigravity，把原版 `resources\bin\language_server.exe` 备份到安装目录外，再替换该文件。已安装第一版入口补丁时，保留原版备份并更换候选文件即可。回滚时退出应用并换回原版。更新 Antigravity 后须按实际版本重新适配。
+```powershell
+python .\fork_toolbar.py --restore
+```
+
+运行单元测试：
+
+```powershell
+python -m unittest .\test_fork_toolbar.py -v
+```
