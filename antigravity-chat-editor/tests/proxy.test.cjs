@@ -59,5 +59,6 @@ test('blocks wrapped old text and unrecognized generation routes', () => {
   assert.throws(() => rewriteRequest(body, [rule()]), /包装/);
   assert.throws(() => routeKind('/v1internal:futureModelPath', true), /尚未适配/);
   assert.equal(routeKind('/v1internal:fetchAvailableModels', true), 'control');
+  assert.equal(routeKind('/v1internal:listExperiments', true), 'control');
   assert.equal(routeKind('/v1internal:streamGenerateContent?alt=sse', true), 'generation');
 });

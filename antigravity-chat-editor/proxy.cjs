@@ -3,11 +3,13 @@ const http = require('node:http');
 const https = require('node:https');
 const zlib = require('node:zlib');
 const crypto = require('node:crypto');
+const { applyRebuiltSummary, clearTextCache } = require('./history.cjs');
+const { createSummaryEngine } = require('./summary.cjs');
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function routeKind(url, hasEdits) {
   if (/^\/v1internal:(?:streamGenerateContent|generateContent)(?:\?|$)/.test(url)) return 'generation';
-  if (/^\/v1internal:(?:loadCodeAssist|fetchUserInfo|retrieveUserQuotaSummary|fetchAdminControls|fetchAvailableModels)(?:\?|$)/.test(url)) return 'control';
+  if (/^\/v1internal:(?:loadCodeAssist|fetchUserInfo|retrieveUserQuotaSummary|fetchAdminControls|fetchAvailableModels|listExperiments)(?:\?|$)/.test(url)) return 'control';
   if (hasEdits) throw new Error('当前请求路径尚未适配编辑，已阻止发送');
   return 'passthrough';
 }
@@ -44,7 +46,7 @@ function rewriteRequest(body, rules) {
     const selected = matches[rule.occurrence];
     for (const [index, part] of selected.parts.entries()) {
       if (index === 0) part.text = rule.text; else delete part.text;
-      delete part.thoughtSignature; delete part.thought_signature;
+      clearTextCache(part);
     }
     selected.content.parts = selected.content.parts.filter(part => Object.keys(part).length);
     changed = true;
@@ -54,14 +56,18 @@ function rewriteRequest(body, rules) {
   return { changed, evidence };
 }
 
-function createProxy({ upstream, getRules, onEvidence, getRulesForRequest = async (_body, rules) => rules }) {
+function createProxy({ upstream, getRules, onEvidence, summaryCacheFile,
+  summaryEngine = createSummaryEngine({ upstream, cacheFile: summaryCacheFile, onProgress: onEvidence }),
+  getRulesForRequest = async (_body, rules) => rules }) {
   const target = new URL(upstream);
   if (target.protocol !== 'https:' || target.username || target.password) throw new Error('上游必须是正常 HTTPS 模型服务');
-  return http.createServer((incoming, outgoing) => {
+  const server = http.createServer((incoming, outgoing) => {
     if (incoming.method !== 'POST' || !incoming.url.startsWith('/v1internal:') || !/^127\.0\.0\.1(?::\d+)?$/.test(incoming.headers.host || '')) {
       outgoing.writeHead(403); outgoing.end('Forbidden'); return;
     }
     const chunks = []; let size = 0;
+    const controller = new AbortController();
+    outgoing.on('close', () => { if (!outgoing.writableFinished) controller.abort(); });
     incoming.on('data', chunk => { size += chunk.length; if (size > 32 * 1024 * 1024) incoming.destroy(new Error('模型请求过大')); else chunks.push(chunk); });
     incoming.on('error', () => { if (!outgoing.headersSent) outgoing.writeHead(413); outgoing.end('Request too large'); });
     incoming.on('end', async () => {
@@ -75,12 +81,21 @@ function createProxy({ upstream, getRules, onEvidence, getRulesForRequest = asyn
           if (encoding === 'gzip') decoded = zlib.gunzipSync(body, { maxOutputLength: 32 * 1024 * 1024 });
           else if (encoding && encoding !== 'identity') throw new Error('不支持此请求压缩格式，已阻止发送');
           const json = JSON.parse(decoded.toString('utf8'));
-          const currentRules = await getRulesForRequest(json, getRules());
-          const result = rewriteRequest(json, currentRules); evidence = result.evidence;
-          if (result.changed) { body = Buffer.from(JSON.stringify(json)); if (encoding === 'gzip') body = zlib.gzipSync(body); }
+          const prepared = await getRulesForRequest(json, getRules());
+          const plan = Array.isArray(prepared) ? { rules: prepared } : prepared;
+          let summaryChanged = false;
+          if (plan.compaction) {
+            const rebuilt = await summaryEngine.rebuild(plan.compaction, { body: json, headers, signal: controller.signal });
+            evidence.push(...applyRebuiltSummary(json, plan.compaction, rebuilt.summary)
+              .map(item => ({ ...item, cached: rebuilt.cached })));
+            summaryChanged = true;
+          }
+          const result = rewriteRequest(json, plan.rules); evidence.push(...result.evidence);
+          if (result.changed || summaryChanged) { body = Buffer.from(JSON.stringify(json)); if (encoding === 'gzip') body = zlib.gzipSync(body); }
         }
       } catch (error) {
-        onEvidence({ state: 'blocked', error: error.message, at: Date.now() });
+        if (outgoing.destroyed) return;
+        onEvidence({ state: 'blocked', path: incoming.url.split('?')[0], error: error.message, at: Date.now() });
         outgoing.writeHead(409, { 'content-type': 'application/json' });
         outgoing.end(JSON.stringify({ error: { code: 409, message: error.message, status: 'FAILED_PRECONDITION' } })); return;
       }
@@ -101,5 +116,7 @@ function createProxy({ upstream, getRules, onEvidence, getRulesForRequest = asyn
       forward.end(body);
     });
   });
+  Object.defineProperty(server, 'editorSummaryEngine', { value: summaryEngine });
+  return server;
 }
 module.exports = { createProxy, rewriteRequest, routeKind, hash };

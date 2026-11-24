@@ -4,20 +4,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const https = require('node:https');
 const { createProxy } = require('./proxy.cjs');
+const { buildEditPlan, refreshRule } = require('./history.cjs');
 const LOCAL = path.join(__dirname, '.local');
 const EDITS = path.join(LOCAL, 'edits.json');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CHANNEL = 'agy-chat-editor:invoke';
-function refreshRule(steps, rule) {
-  const target = steps.findIndex(step => step.plannerResponse?.messageId === rule.messageId &&
-    step.plannerResponse.response === rule.original && step.status === 'CORTEX_STEP_STATUS_DONE');
-  if (target < 0) throw new Error('编辑的原始回复已变化，已阻止发送；请重新保存编辑');
-  if (steps.slice(target + 1).some(step => step.checkpoint || step.type === 'CORTEX_STEP_TYPE_BRAIN_UPDATE')) throw new Error('编辑的回复已进入新摘要，已阻止发送；请移除该编辑');
-  const segment = steps.slice(0, target).findLastIndex(step => step.checkpoint) + 1;
-  const matching = steps.map((step, index) => ({ step, index })).filter(({ step, index }) =>
-    index >= segment && step.status === 'CORTEX_STEP_STATUS_DONE' && step.plannerResponse?.response === rule.original);
-  return { ...rule, occurrence: matching.findIndex(item => item.index === target), matchCount: matching.length };
-}
 function atomicJSON(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = file + '.tmp'; fs.writeFileSync(temporary, JSON.stringify(value, null, 2), { mode: 0o600 }); fs.renameSync(temporary, file);
@@ -60,12 +51,13 @@ function start(languageServer) {
       if (!original || new URL(original).protocol !== 'https:') throw new Error('无法确认原始模型服务地址');
       upstream = original;
       if (!relay) {
-        relay = createProxy({ upstream, getRules: () => rules, getRulesForRequest: async (body, snapshot) => {
+        relay = createProxy({ upstream, getRules: () => rules, summaryCacheFile: path.join(LOCAL, 'summary-cache.json'),
+          getRulesForRequest: async (body, snapshot) => {
           const cascadeId = body.request?.labels?.cascade_id || /^agent\/([0-9a-f-]{36})\//i.exec(body.requestId || '')?.[1];
           const active = snapshot.filter(rule => rule.cascadeId === cascadeId);
           if (!active.length) return [];
           const currentSteps = await getSteps(cascadeId);
-          return active.map(rule => refreshRule(currentSteps, rule));
+          return buildEditPlan(currentSteps, active, body);
         }, onEvidence: value => {
           if (value.state === 'forwarded' && !value.evidence?.length) return;
           last = value;
@@ -101,7 +93,6 @@ function start(languageServer) {
         step.plannerResponse?.messageId === input.messageId && step.plannerResponse?.response === input.original);
       if (matches.length !== 1 || matches[0].step.status !== 'CORTEX_STEP_STATUS_DONE') throw new Error('消息已变化或尚未完成，请重新打开编辑器');
       const target = matches[0].index;
-      if (steps.slice(target + 1).some(step => step.checkpoint || step.type === 'CORTEX_STEP_TYPE_BRAIN_UPDATE')) throw new Error('此回复已经进入压缩摘要，暂不能可靠替换');
       const segment = steps.slice(0, target).findLastIndex(step => step.checkpoint) + 1;
       const matching = steps.map((step, index) => ({ step, index })).filter(({ step, index }) => index >= segment && step.plannerResponse?.response === input.original);
       const key = cascadeId + '/' + input.messageId;

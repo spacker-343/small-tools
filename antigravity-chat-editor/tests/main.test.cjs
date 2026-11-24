@@ -35,7 +35,7 @@ test('accepts a live /c/id chat, persists an edit, and never quits the app', asy
   const context = vm.createContext({ module, exports: module.exports, __dirname: directory, console, Buffer, URL,
     require: name => name === 'electron' ? electron : name === 'node:https' ? fakeHTTPS : name === './proxy.cjs' ? {
       createProxy: () => ({ once() {}, listen(_port, _host, callback) { callback(); }, address: () => ({ port: 23456 }), close() {} }),
-    } : require(name) });
+    } : name.startsWith('./') ? require(path.join(__dirname, '..', name)) : require(name) });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../main.cjs'), 'utf8'), context);
   let runtime;
   try {
