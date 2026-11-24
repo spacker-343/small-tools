@@ -12,7 +12,7 @@
 4. 发送下一条消息后，可运行 `核验请求.cmd` 检查最近一次包含编辑的实际转发记录。
 5. 再次编辑并改回原文，即可移除此条替换规则。
 
-编辑后的正文使用安全的纯文本预览，保留换行与原始 Markdown 字符。运行需要 Windows；安装与诊断脚本需要 Python 3.10+。应用内运行使用 Antigravity 自带的 Electron / Node，不需要单独安装 Node 或 npm。
+编辑后的正文会渲染 Markdown，包括标题、粗体、列表、引用、行内代码、围栏代码块、表格和链接；再次编辑以及发送给模型时保留原始 Markdown。原始 HTML 不作为可执行内容渲染。运行需要 Windows；安装与诊断脚本需要 Python 3.10+。应用内运行使用 Antigravity 自带的 Electron / Node，不需要单独安装 Node 或 npm。
 
 ## 实际模型请求如何修改
 
@@ -69,3 +69,5 @@ npm test
 ```
 
 测试覆盖气泡内编辑、主聊天和侧栏定位、`/c/<ID>` 页面权限、即时保存不退出应用、会话隔离、重复正文定位、思考及用户消息保留、签名和缓存处理、未知结构拦截，以及安装包回读和跨版本能力检测。
+
+`renderer.source.js` 是可维护的界面源代码，`markdown.js` 使用 [markdown-it](https://github.com/markdown-it/markdown-it) 解析 Markdown，并通过 [DOMPurify](https://github.com/cure53/DOMPurify) 清理生成的 HTML。`npm run build` 将代码和依赖打包成自包含的 `renderer.js`，同时生成 `renderer.licenses.txt`；发布时保留这两个生成文件，使用者无需安装依赖或从 CDN 加载脚本。

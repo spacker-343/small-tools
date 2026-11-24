@@ -53,7 +53,7 @@ test('injects bubble button, edits source, and sends the replacement to the nati
   assert.equal(save.request.text, '新回复');
   assert.equal(save.request.original, '**original**');
   assert.equal(save.request.messageId, 'bot-a');
-  assert.equal(w.document.querySelector('.agy-edited-preview div').textContent, '新回复');
+  assert.equal(w.document.querySelector('.agy-markdown p').textContent, '新回复');
   assert.equal(w.document.querySelector('.agy-edit-dialog'), null);
   assert.equal(w.document.querySelector('.agy-edit-notice'), null);
   w.eval(script);
