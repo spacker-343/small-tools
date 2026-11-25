@@ -10,6 +10,8 @@
 
 普通 Windows 文件夹不会从原生菜单获得任意本地目录选择。此版本只恢复原有入口和行为。[Google 官方布局与工作区说明](https://antigravity.google/docs/settings#interface-layout)
 
+`fork_workspace.js` 保留独立目录派生的参考代码，当前安装器不加载它。该片段依赖 Antigravity 前端 bundle 的内部符号，不能独立运行；接入其他版本前需要适配符号并验证目录隔离与派生行为。
+
 ## 升级后一键恢复 / 安装（推荐）
 
 Antigravity 每次升级都会覆盖 `resources\bin\language_server.exe`。现在无需手动改版本号或手动备份/复制文件：
