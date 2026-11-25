@@ -19,6 +19,16 @@ TARGET_FLAGS = (
     "conversationForkingEnabled",
     "conversationForkingHistoricalStep",
 )
+SUBAGENT_FORK_FLAG = b"enable-fork-with-subagents"
+SUBAGENT_FORK_FUNC_SUFFIX = "allowForkWithSubagents"
+RETURN_TRUE_STUB = b"\xb8\x01\x00\x00\x00\xc3"  # mov eax, 1; ret
+PCLNTAB_MAGICS = (b"\xf1\xff\xff\xff\x00\x00", b"\xf0\xff\xff\xff\x00\x00")
+PROLOGUE_PREFIXES = (
+    b"\x49\x3b\x66\x10",  # cmp rsp, [r14+0x10]
+    b"\x4c\x8d",          # lea r12, [rsp-...]
+    b"\x55",              # push rbp
+    b"\x48\x83\xec",      # sub rsp, imm8
+)
 
 
 def read_installed_package(install: Path) -> dict:
@@ -105,13 +115,181 @@ def locate_renderer(data: bytes) -> tuple[int, int, zipfile.ZipFile]:
     raise ValueError("Antigravity renderer archive not found")
 
 
-def inspect_binary_patched(binary_path: Path) -> bool:
-    """Check whether a language_server.exe binary already has the Fork patch."""
+def inspect_binary_patch_state(binary_path: Path) -> tuple[bool, bool]:
+    """Return (renderer_patched, subagent_fork_patched) for a language_server.exe binary."""
     data = binary_path.read_bytes()
     _, _, archive = locate_renderer(data)
     with archive:
         main_js = archive.read("main.js").decode("utf-8")
-    return is_renderer_patched(main_js)
+    return is_renderer_patched(main_js), is_subagent_fork_patched(data)
+
+
+def inspect_binary_patched(binary_path: Path) -> bool:
+    """Check whether a language_server.exe binary already has all Fork patches."""
+    renderer_patched, subagent_patched = inspect_binary_patch_state(binary_path)
+    return renderer_patched and subagent_patched
+
+
+def parse_pe64_sections(data: bytes) -> tuple[int, list[tuple[str, int, int, int, int]]]:
+    """Parse PE32+ image base and section headers from a Windows x64 executable."""
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        raise ValueError("Not a valid PE executable")
+    pe_off = struct.unpack_from("<I", data, 0x3C)[0]
+    if pe_off + 24 > len(data) or data[pe_off:pe_off + 4] != b"PE\x00\x00":
+        raise ValueError("Invalid PE header signature")
+    machine, num_sections, _, _, _, opt_size, _ = struct.unpack_from("<HHIIIHH", data, pe_off + 4)
+    if machine != 0x8664:
+        raise ValueError(f"Unsupported PE architecture: 0x{machine:04x} (expected x64)")
+    opt_off = pe_off + 24
+    if opt_off + opt_size > len(data) or opt_size < 32:
+        raise ValueError("Truncated PE optional header")
+    magic = struct.unpack_from("<H", data, opt_off)[0]
+    if magic != 0x020B:
+        raise ValueError(f"Unsupported PE optional header magic: 0x{magic:04x} (expected PE32+)")
+    image_base = struct.unpack_from("<Q", data, opt_off + 24)[0]
+
+    sec_off = opt_off + opt_size
+    if sec_off + num_sections * 40 > len(data):
+        raise ValueError("Truncated PE section table")
+    sections: list[tuple[str, int, int, int, int]] = []
+    for i in range(num_sections):
+        off = sec_off + i * 40
+        name = data[off:off + 8].rstrip(b"\x00").decode("latin1")
+        vsize, vaddr, rsize, rptr = struct.unpack_from("<IIII", data, off + 8)
+        sections.append((name, vaddr, vsize, rptr, rsize))
+    return image_base, sections
+
+
+def raw_to_va(raw: int, image_base: int, sections: list[tuple[str, int, int, int, int]]) -> int | None:
+    """Convert a raw file offset to a virtual address if it lies inside a PE section."""
+    for _, vaddr, _, rptr, rsize in sections:
+        if rptr <= raw < rptr + rsize:
+            return image_base + vaddr + (raw - rptr)
+    return None
+
+
+def find_rip_lea_refs(data: bytes, text_section: tuple[str, int, int, int, int], image_base: int, target_vas: set[int]) -> list[int]:
+    """Return raw offsets of RIP-relative LEA instructions in .text targeting target_vas."""
+    _, tvaddr, _, trptr, trsize = text_section
+    text_va = image_base + tvaddr
+    text_bytes = data[trptr:trptr + trsize]
+    pattern = re.compile(rb"[\x48\x4c]\x8d[\x05\x0d\x15\x1d\x25\x2d\x35\x3d]")
+    hits: list[int] = []
+    for match in pattern.finditer(text_bytes):
+        idx = match.start()
+        if idx + 7 > len(text_bytes):
+            continue
+        disp = struct.unpack_from("<i", text_bytes, idx + 3)[0]
+        if text_va + idx + 7 + disp in target_vas:
+            hits.append(trptr + idx)
+    return hits
+
+
+def lookup_gopclntab_function(data: bytes, text_va: int, target_va: int) -> tuple[int, str]:
+    """Resolve the Go function entry VA and name containing target_va from gopclntab."""
+    for magic in PCLNTAB_MAGICS:
+        pos = 0
+        while (pos := data.find(magic, pos)) >= 0:
+            if pos + 72 > len(data):
+                break
+            min_lc, ptr_sz = data[pos + 6], data[pos + 7]
+            if ptr_sz != 8 or min_lc not in (1, 2, 4):
+                pos += 1
+                continue
+            nfunc = struct.unpack_from("<Q", data, pos + 8)[0]
+            if not (1 <= nfunc <= 5_000_000):
+                pos += 1
+                continue
+            text_start, funcname_off, _, _, _, pcln_off = struct.unpack_from("<QQQQQQ", data, pos + 24)
+            ftab_off = pos + pcln_off
+            if ftab_off + nfunc * 8 > len(data) or pos + funcname_off >= len(data):
+                pos += 1
+                continue
+
+            base_va = text_start if text_start else text_va
+            rel = target_va - base_va
+            if rel < 0:
+                pos += 1
+                continue
+            lo, hi = 0, nfunc - 1
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                entry_off, _ = struct.unpack_from("<II", data, ftab_off + mid * 8)
+                if entry_off <= rel:
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            if hi >= 0:
+                entry_off, func_off = struct.unpack_from("<II", data, ftab_off + hi * 8)
+                if ftab_off + func_off + 8 <= len(data):
+                    name_off = struct.unpack_from("<i", data, ftab_off + func_off + 4)[0]
+                    fn_start = pos + funcname_off + name_off
+                    if 0 <= fn_start < len(data):
+                        fn_end = data.find(b"\x00", fn_start)
+                        if fn_end != -1:
+                            return base_va + entry_off, data[fn_start:fn_end].decode("utf-8", "replace")
+            pos += 1
+    raise ValueError("Could not resolve allowForkWithSubagents in Go pclntab")
+
+
+def locate_subagent_fork_entry(data: bytes) -> int:
+    """Locate the raw file offset of CascadeManager.allowForkWithSubagents."""
+    image_base, sections = parse_pe64_sections(data)
+    text_sections = [s for s in sections if s[0] == ".text"]
+    if len(text_sections) != 1:
+        raise ValueError(f"Expected 1 .text section in PE binary; found {len(text_sections)}")
+    text_section = text_sections[0]
+    _, tvaddr, _, trptr, trsize = text_section
+    text_va = image_base + tvaddr
+
+    target_vas: set[int] = set()
+    pos = 0
+    while (pos := data.find(SUBAGENT_FORK_FLAG, pos)) >= 0:
+        va = raw_to_va(pos, image_base, sections)
+        if va is not None:
+            target_vas.add(va)
+        pos += 1
+    if not target_vas:
+        raise ValueError("Could not locate enable-fork-with-subagents flag string in binary")
+
+    lea_raws = find_rip_lea_refs(data, text_section, image_base, target_vas)
+    if len(lea_raws) != 1:
+        raise ValueError(
+            f"Expected 1 reference to enable-fork-with-subagents; found {len(lea_raws)}"
+        )
+    lea_raw = lea_raws[0]
+    lea_va = text_va + (lea_raw - trptr)
+
+    func_va, func_name = lookup_gopclntab_function(data, text_va, lea_va)
+    if not func_name.endswith(f".{SUBAGENT_FORK_FUNC_SUFFIX}"):
+        raise ValueError(f"Unexpected function for enable-fork-with-subagents: {func_name}")
+
+    func_raw = trptr + (func_va - text_va)
+    if not (trptr <= func_raw < trptr + trsize) or not (len(RETURN_TRUE_STUB) <= lea_raw - func_raw <= 0x200):
+        raise ValueError(f"Unexpected layout around {func_name}")
+    return func_raw
+
+
+def is_subagent_fork_patched(data: bytes) -> bool:
+    """Return True if allowForkWithSubagents already returns true unconditionally."""
+    func_raw = locate_subagent_fork_entry(data)
+    return data[func_raw:func_raw + len(RETURN_TRUE_STUB)] == RETURN_TRUE_STUB
+
+
+def patch_subagent_fork(data: bytes) -> tuple[bytes, bool]:
+    """Patch CascadeManager.allowForkWithSubagents to return true unconditionally.
+
+    Returns (patched_bytes, changed).
+    """
+    func_raw = locate_subagent_fork_entry(data)
+    current = data[func_raw:func_raw + len(RETURN_TRUE_STUB)]
+    if current == RETURN_TRUE_STUB:
+        return data, False
+    if not any(current.startswith(prefix) for prefix in PROLOGUE_PREFIXES):
+        raise ValueError(f"Unexpected prologue bytes in allowForkWithSubagents: {current.hex()}")
+    patched = bytearray(data)
+    patched[func_raw:func_raw + len(RETURN_TRUE_STUB)] = RETURN_TRUE_STUB
+    return bytes(patched), True
 
 
 def atomic_write_bytes(target: Path, data: bytes) -> None:
@@ -150,12 +328,12 @@ def build_from_binary(source_exe: Path, output: Path) -> tuple[bool, int]:
     data = source_exe.read_bytes()
     begin, end, original = locate_renderer(data)
     buffer = io.BytesIO()
-    changed = False
+    renderer_changed = False
     with original, zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as patched:
         for name in original.namelist():
             content = original.read(name)
             if name == "main.js":
-                patched_js, changed = patch_renderer(content.decode("utf-8"))
+                patched_js, renderer_changed = patch_renderer(content.decode("utf-8"))
                 content = patched_js.encode("utf-8")
             patched.writestr(name, content)
 
@@ -169,11 +347,12 @@ def build_from_binary(source_exe: Path, output: Path) -> tuple[bool, int]:
     # Go locates this embedded ZIP using a fixed-size slice. Keep its exact size.
     payload = payload[:-2] + struct.pack("<H", remaining) + b" " * remaining
     result_bytes = data[:begin] + payload + data[end:]
+    result_bytes, subagent_changed = patch_subagent_fork(result_bytes)
     if len(result_bytes) != len(data):
         raise ValueError("Internal error: patched binary size mismatch")
 
     atomic_write_bytes(output, result_bytes)
-    return changed, len(result_bytes)
+    return (renderer_changed or subagent_changed), len(result_bytes)
 
 
 def build(install: Path, output: Path, expected_version: str | None = None) -> str:
@@ -235,16 +414,20 @@ def apply_patch(
         raise ValueError(f"Installed binary not found: {installed_exe}")
 
     existing_backup = find_official_backup(backup_dir, output.parent, version)
-    already_patched = inspect_binary_patched(installed_exe)
+    renderer_patched, subagent_patched = inspect_binary_patch_state(installed_exe)
+    already_patched = renderer_patched and subagent_patched
+    partially_patched = renderer_patched or subagent_patched
 
     if already_patched:
         if existing_backup is None:
             build_from_binary(installed_exe, output)
             return version, None, True
         source_exe = existing_backup
+    elif existing_backup is not None:
+        source_exe = existing_backup
     else:
-        backup_target = backup_dir / f"language_server-{version}-official.exe"
-        if existing_backup is None:
+        if not partially_patched:
+            backup_target = backup_dir / f"language_server-{version}-official.exe"
             atomic_copy_file(installed_exe, backup_target)
             existing_backup = backup_target
         source_exe = installed_exe
@@ -300,7 +483,8 @@ def main() -> None:
                 print(f"Antigravity {version} is already patched (synced {args.output.resolve()}).")
             else:
                 print(f"Patched Antigravity {version} successfully.")
-                print(f"Official backup: {backup.resolve()}")
+                if backup is not None:
+                    print(f"Official backup: {backup.resolve()}")
                 print(f"Installed binary: {(args.install / 'resources' / 'bin' / 'language_server.exe').resolve()}")
         else:
             version = build(args.install, args.output, args.expected_version)
