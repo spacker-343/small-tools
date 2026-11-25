@@ -20,6 +20,62 @@ function fakeUpstream(t, captured) {
 }
 async function listen(server) { await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); return 'http://127.0.0.1:' + server.address().port; }
 
+test('native background generation without matching rules is forwarded byte for byte', async t => {
+  const captured = []; fakeUpstream(t, captured);
+  const body = { requestId: 'native-background-check', request: { contents: [{ role: 'user', parts: [{ text: 'native check' }] }] } };
+  const server = createProxy({ upstream: 'https://example.com', getRules: () => [{ cascadeId: ID }], onEvidence() {},
+    getRulesForRequest: async () => [] });
+  try {
+    const url = await listen(server);
+    const response = await fetch(url + '/v1internal:generateContent', { method: 'POST', body: JSON.stringify(body) });
+    assert.equal(response.status, 200); await response.text();
+    assert.deepEqual(captured, [body]);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('conflicting identities are blocked even when rule preparation would return empty', async t => {
+  const captured = []; fakeUpstream(t, captured);
+  const server = createProxy({ upstream: 'https://example.com', getRules: () => [{ cascadeId: ID }], onEvidence() {},
+    getRulesForRequest: async () => [] });
+  try {
+    const url = await listen(server);
+    for (const body of [
+      { requestId: 'agent/' + ID + '/turn', request: { labels: { cascade_id: '22222222-2222-4222-8222-222222222222' } } },
+      { requestId: 'agent/malformed/turn', request: {} }
+    ]) {
+      const response = await fetch(url + '/v1internal:streamGenerateContent', { method: 'POST', body: JSON.stringify(body) });
+      assert.equal(response.status, 409); await response.text();
+    }
+    assert.equal(captured.length, 0);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('Fork ACL sync and native GET endpoint preserve methods and payloads with edits enabled', async t => {
+  const captured = [];
+  t.mock.method(https, 'request', (options, callback) => {
+    const request = new EventEmitter(); request.setTimeout = () => request;
+    request.end = bytes => {
+      captured.push({ method: options.method, path: options.path, body: bytes.toString() });
+      const response = Readable.from(['{}']); response.statusCode = 200; response.headers = {};
+      callback(response);
+    };
+    request.destroy = () => {}; return request;
+  });
+  const server = createProxy({ upstream: 'https://example.com', getRules: () => [{ cascadeId: ID }], onEvidence() {},
+    getRulesForRequest: async () => { throw new Error('must not inspect controls'); } });
+  try {
+    const url = await listen(server);
+    for (const entry of [{ method: 'POST', path: '/v1internal:writeTrajectoryAcls', body: '{"trajectory":"test"}' },
+      { method: 'GET', path: '/v1internal/cascadeNuxes?page_size=1000', body: '' }]) {
+      const response = await fetch(url + entry.path, { method: entry.method, ...(entry.method === 'POST' ? { body: entry.body } : {}) });
+      assert.equal(response.status, 200); await response.text();
+      assert.deepEqual(captured.at(-1), entry);
+    }
+    const denied = await fetch(url + '/v1internal/privateEndpoint');
+    assert.equal(denied.status, 403); await denied.text();
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
 test('listExperiments passes through while edit rules exist', async t => {
   const captured = []; fakeUpstream(t, captured);
   const server = createProxy({ upstream: 'https://example.com', getRules: () => [{ key: 'edited' }], onEvidence() {},

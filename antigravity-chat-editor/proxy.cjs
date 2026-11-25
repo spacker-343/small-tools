@@ -9,17 +9,26 @@ const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function routeKind(url, hasEdits) {
   if (/^\/v1internal:(?:streamGenerateContent|generateContent)(?:\?|$)/.test(url)) return 'generation';
-  if (/^\/v1internal:(?:loadCodeAssist|fetchUserInfo|retrieveUserQuotaSummary|fetchAdminControls|fetchAvailableModels|listExperiments)(?:\?|$)/.test(url)) return 'control';
+  if (/^\/v1internal:(?:loadCodeAssist|fetchUserInfo|retrieveUserQuotaSummary|fetchAdminControls|fetchAvailableModels|listExperiments|writeTrajectoryAcls)(?:\?|$)/.test(url)) return 'control';
+  if (/^\/v1internal\/cascadeNuxes(?:\?|$)/.test(url)) return 'control';
   if (hasEdits) throw new Error('当前请求路径尚未适配编辑，已阻止发送');
   return 'passthrough';
 }
 
-function rewriteRequest(body, rules) {
+function requestIdentity(body, allowUnscoped = false) {
   const request = body.request;
   const fromId = /^agent\/([0-9a-f-]{36})\//i.exec(body.requestId || '')?.[1];
+  if (allowUnscoped && request?.labels?.cascade_id === undefined && !String(body.requestId || '').startsWith('agent/')) return null;
+  if (String(body.requestId || '').startsWith('agent/') && !fromId) throw new Error('无法识别模型请求所属会话，已阻止发送');
   const cascadeId = request?.labels?.cascade_id || fromId;
   if (!uuid.test(cascadeId || '')) throw new Error('无法识别模型请求所属会话，已阻止发送');
   if (fromId && fromId !== cascadeId) throw new Error('模型请求会话标识不一致，已阻止发送');
+  return cascadeId;
+}
+
+function rewriteRequest(body, rules) {
+  const request = body.request;
+  const cascadeId = requestIdentity(body);
   const active = rules.filter(rule => rule.cascadeId === cascadeId);
   if (!active.length) return { changed: false, evidence: [] };
   if (!Array.isArray(request?.contents)) throw new Error('模型输入结构不兼容，已阻止发送旧内容');
@@ -62,7 +71,9 @@ function createProxy({ upstream, getRules, onEvidence, summaryCacheFile,
   const target = new URL(upstream);
   if (target.protocol !== 'https:' || target.username || target.password) throw new Error('上游必须是正常 HTTPS 模型服务');
   const server = http.createServer((incoming, outgoing) => {
-    if (incoming.method !== 'POST' || !incoming.url.startsWith('/v1internal:') || !/^127\.0\.0\.1(?::\d+)?$/.test(incoming.headers.host || '')) {
+    const allowed = incoming.method === 'POST' && incoming.url.startsWith('/v1internal:') ||
+      incoming.method === 'GET' && /^\/v1internal\/cascadeNuxes(?:\?|$)/.test(incoming.url);
+    if (!allowed || !/^127\.0\.0\.1(?::\d+)?$/.test(incoming.headers.host || '')) {
       outgoing.writeHead(403); outgoing.end('Forbidden'); return;
     }
     const chunks = []; let size = 0;
@@ -81,6 +92,7 @@ function createProxy({ upstream, getRules, onEvidence, summaryCacheFile,
           if (encoding === 'gzip') decoded = zlib.gunzipSync(body, { maxOutputLength: 32 * 1024 * 1024 });
           else if (encoding && encoding !== 'identity') throw new Error('不支持此请求压缩格式，已阻止发送');
           const json = JSON.parse(decoded.toString('utf8'));
+          requestIdentity(json, true);
           const prepared = await getRulesForRequest(json, getRules());
           const plan = Array.isArray(prepared) ? { rules: prepared } : prepared;
           let summaryChanged = false;
@@ -90,7 +102,10 @@ function createProxy({ upstream, getRules, onEvidence, summaryCacheFile,
               .map(item => ({ ...item, cached: rebuilt.cached })));
             summaryChanged = true;
           }
-          const result = rewriteRequest(json, plan.rules); evidence.push(...result.evidence);
+          // Unrelated service calls (including native background checks) have
+          // no matching edit rules. Forward them unchanged to the real service.
+          const result = plan.rules.length ? rewriteRequest(json, plan.rules) : { changed: false, evidence: [] };
+          evidence.push(...result.evidence);
           if (result.changed || summaryChanged) { body = Buffer.from(JSON.stringify(json)); if (encoding === 'gzip') body = zlib.gzipSync(body); }
         }
       } catch (error) {
@@ -101,7 +116,7 @@ function createProxy({ upstream, getRules, onEvidence, summaryCacheFile,
       }
       headers['content-length'] = String(body.length);
       const forward = https.request({ hostname: target.hostname, port: target.port || 443,
-        path: target.pathname.replace(/\/$/, '') + incoming.url, method: 'POST', headers }, response => {
+        path: target.pathname.replace(/\/$/, '') + incoming.url, method: incoming.method, headers }, response => {
         onEvidence({ state: 'forwarded', status: response.statusCode, evidence, at: Date.now() });
         outgoing.writeHead(response.statusCode, response.headers); response.pipe(outgoing);
         response.on('error', () => outgoing.destroy());
