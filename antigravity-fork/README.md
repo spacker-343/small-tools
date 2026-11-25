@@ -24,7 +24,7 @@ python .\fork_toolbar.py --apply
 脚本会自动完成：
 - 从 `resources\app.asar` 自动识别当前安装的 Antigravity 版本（不再写死版本号）；
 - 自动将当前版本的原版 `language_server.exe` 备份到 `build\backups\language_server-<version>-official.exe`（若已是补丁版则不会覆盖原版备份）；
-- 正则匹配并开启 `conversationForkingEnabled` 与 `conversationForkingHistoricalStep`，保持内嵌 ZIP 与二进制体积完全一致后原子替换生效；
+- 正则匹配并开启 `conversationForkingEnabled` 与 `conversationForkingHistoricalStep`，同时定位 Go 后端 `CascadeManager.allowForkWithSubagents`（`enable-fork-with-subagents`）放行携带 Swarm / 子 Agent 记录的会话 Fork，保持内嵌 ZIP 与二进制体积完全一致后原子替换生效；
 - 如果未来某个新版本官方已经原生开启这两个开关，脚本会直接提示你无需再打补丁。
 
 ## 其他命令
