@@ -34,8 +34,15 @@ def make_asar(package_obj: dict) -> bytes:
     )
 
 
-def make_fake_exe(main_js: str, extra_padding: int = 128) -> bytes:
-    """Create a synthetic Go-like binary with an embedded renderer ZIP."""
+def make_fake_exe(
+    main_js: str,
+    extra_padding: int = 128,
+    *,
+    include_subagent_flag: bool = True,
+    duplicate_subagent_ref: bool = False,
+    func_name: str = "google3/third_party/jetski/cortex/cortex.(*CascadeManager).allowForkWithSubagents",
+) -> bytes:
+    """Create a synthetic PE32+ Go-like binary with pclntab and an embedded renderer ZIP."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         zf.writestr("index.html", "<html></html>")
@@ -43,7 +50,71 @@ def make_fake_exe(main_js: str, extra_padding: int = 128) -> bytes:
     zip_bytes = buf.getvalue()
     # Add extra comment padding so compressed patched output fits easily.
     zip_bytes = zip_bytes[:-2] + struct.pack("<H", extra_padding) + b" " * extra_padding
-    return b"MZ_FAKE_PREFIX_" + zip_bytes + b"_FAKE_SUFFIX"
+
+    image_base = 0x140000000
+    text_vaddr = 0x1000
+    rdata_vaddr = 0x2000
+    pe_off = 0x80
+    opt_size = 240
+    num_sections = 2
+    headers_end = pe_off + 24 + opt_size + num_sections * 40
+    text_rptr = (headers_end + 0x1FF) & ~0x1FF  # 0x400
+
+    # Reserve exact .rdata layout: flag string at offset 0, pclntab right after.
+    flag_bytes = b"enable-fork-with-subagents\x00" if include_subagent_flag else b"other-flag\x00"
+    str_va = image_base + rdata_vaddr
+
+    # Build .text: cmp rsp,[r14+0x10]; jbe +0x10; lea rbx,[rip+disp]; mov ecx,0x1a; call rdx; leave; ret
+    prologue = b"\x49\x3b\x66\x10\x76\x10\x55\x48\x89\xe5"
+    lea_off = len(prologue)
+    lea_va = image_base + text_vaddr + lea_off
+    disp = str_va - (lea_va + 7)
+    text_code = bytearray(
+        prologue + b"\x48\x8d\x1d" + struct.pack("<i", disp) + b"\xb9\x1a\x00\x00\x00\xff\xd2\xc9\xc3"
+    )
+    if duplicate_subagent_ref:
+        lea2_va = image_base + text_vaddr + len(text_code)
+        disp2 = str_va - (lea2_va + 7)
+        text_code.extend(b"\x48\x8d\x1d" + struct.pack("<i", disp2) + b"\xc3")
+    text_rsize = (len(text_code) + 0x1FF) & ~0x1FF
+    text_padded = bytes(text_code).ljust(text_rsize, b"\xcc")
+
+    # Build Go 1.20+ pclntab in .rdata
+    funcname_bytes = func_name.encode("utf-8") + b"\x00"
+    header_len = 72
+    funcname_off = header_len
+    pcln_off = funcname_off + len(funcname_bytes)
+    ftab = struct.pack("<II", 0, 8) + struct.pack("<Ii", 0, 0)
+    pclntab = (
+        b"\xf1\xff\xff\xff\x00\x00\x01\x08"
+        + struct.pack("<QQQQQQQQ", 1, 0, image_base + text_vaddr, funcname_off, 0, 0, 0, pcln_off)
+        + funcname_bytes
+        + ftab
+    )
+    rdata_raw = flag_bytes + pclntab
+    rdata_rsize = (len(rdata_raw) + 0x1FF) & ~0x1FF
+    rdata_padded = rdata_raw.ljust(rdata_rsize, b"\x00")
+    rdata_rptr = text_rptr + text_rsize
+
+    dos_header = bytearray(pe_off)
+    dos_header[0:2] = b"MZ"
+    struct.pack_into("<I", dos_header, 0x3C, pe_off)
+
+    coff = b"PE\x00\x00" + struct.pack("<HHIIIHH", 0x8664, num_sections, 0, 0, 0, opt_size, 0x22)
+    opt = bytearray(opt_size)
+    struct.pack_into("<H", opt, 0, 0x020B)
+    struct.pack_into("<Q", opt, 24, image_base)
+
+    sec_text = struct.pack(
+        "<8sIIIIIIHHI", b".text", len(text_code), text_vaddr, text_rsize, text_rptr, 0, 0, 0, 0, 0x60000020
+    )
+    sec_rdata = struct.pack(
+        "<8sIIIIIIHHI", b".rdata", len(rdata_raw), rdata_vaddr, rdata_rsize, rdata_rptr, 0, 0, 0, 0, 0x40000040
+    )
+
+    headers = bytes(dos_header) + coff + bytes(opt) + sec_text + sec_rdata
+    headers = headers.ljust(text_rptr, b"\x00")
+    return headers + text_padded + rdata_padded + zip_bytes + b"_FAKE_SUFFIX"
 
 
 class ForkToolbarTests(unittest.TestCase):
@@ -143,17 +214,27 @@ class ForkToolbarTests(unittest.TestCase):
             )
             installed_exe = install / "resources" / "bin" / "language_server.exe"
             patched_js, _ = fork_toolbar.patch_renderer(self.SAMPLE_JS)
-            installed_exe.write_bytes(make_fake_exe(patched_js))
+            partially_patched_bytes = make_fake_exe(patched_js)
+            installed_exe.write_bytes(partially_patched_bytes)
 
             output = root / "work" / "build" / "language_server-native-fork-history.exe"
             backup_dir = root / "work" / "build" / "backups"
 
             with mock.patch.object(fork_toolbar, "ensure_antigravity_stopped"):
-                # Already patched and no backup -> backup_path must be None
+                # Upgrading a partial (main.js-only) binary without backup must apply the Go patch
+                # and must NOT save the partially-patched binary as an official backup.
                 version, backup, already = fork_toolbar.apply_patch(install, output, backup_dir)
                 self.assertEqual(version, "2.33.0")
                 self.assertIsNone(backup)
-                self.assertTrue(already)
+                self.assertFalse(already)
+                self.assertTrue(fork_toolbar.inspect_binary_patched(installed_exe))
+                self.assertFalse((backup_dir / "language_server-2.33.0-official.exe").exists())
+
+                # Re-running when fully patched and no backup -> already_installed=True, backup=None
+                version2, backup2, already2 = fork_toolbar.apply_patch(install, output, backup_dir)
+                self.assertEqual(version2, "2.33.0")
+                self.assertIsNone(backup2)
+                self.assertTrue(already2)
 
                 # Legacy backup in output.parent should be discovered for restore
                 legacy_bytes = make_fake_exe(self.SAMPLE_JS)
@@ -163,6 +244,25 @@ class ForkToolbarTests(unittest.TestCase):
                 self.assertEqual(r_version, "2.33.0")
                 self.assertEqual(r_backup, legacy_backup)
                 self.assertEqual(installed_exe.read_bytes(), legacy_bytes)
+
+    def test_patch_subagent_fork_idempotent_and_validation(self):
+        raw = make_fake_exe(self.SAMPLE_JS)
+        self.assertFalse(fork_toolbar.is_subagent_fork_patched(raw))
+        patched, changed = fork_toolbar.patch_subagent_fork(raw)
+        self.assertTrue(changed)
+        self.assertEqual(len(patched), len(raw))
+        self.assertTrue(fork_toolbar.is_subagent_fork_patched(patched))
+
+        patched_again, changed_again = fork_toolbar.patch_subagent_fork(patched)
+        self.assertFalse(changed_again)
+        self.assertEqual(patched, patched_again)
+
+        with self.assertRaises(ValueError):
+            fork_toolbar.patch_subagent_fork(make_fake_exe(self.SAMPLE_JS, include_subagent_flag=False))
+        with self.assertRaises(ValueError):
+            fork_toolbar.patch_subagent_fork(make_fake_exe(self.SAMPLE_JS, duplicate_subagent_ref=True))
+        with self.assertRaises(ValueError):
+            fork_toolbar.patch_subagent_fork(make_fake_exe(self.SAMPLE_JS, func_name="other.func"))
 
     def test_ensure_antigravity_stopped_raises_when_running(self):
         fake_proc = mock.Mock(returncode=0, stdout="Antigravity.exe              12345 Console")
