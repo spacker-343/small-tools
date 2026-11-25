@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "update-guard": {
+      "command": "python",
+      "args": ["${PLUGIN_ROOT}/scripts/mcp_server.py"]
+    }
+  }
+}

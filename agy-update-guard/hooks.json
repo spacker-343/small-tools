@@ -1,0 +1,11 @@
+{
+  "update-guard-notice": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python scripts/session_hook.py",
+        "timeout": 5
+      }
+    ]
+  }
+}

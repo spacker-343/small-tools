@@ -1,0 +1,21 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "agy-update-guard",
+  "displayName": "Update Guard",
+  "version": "1.1.0",
+  "description": "零额度定时巡检 Antigravity 官方 Changelog、模型可用性与本机 builtin 内置技能配置快照差异；发现更新或配置变更时在应用内展示提醒横幅与交互状态卡片，支持点击按钮一键新建对话完成版本兼容性与工作区权限评估。",
+  "logo": "assets/logo.svg",
+  "license": "MIT",
+  "keywords": [
+    "changelog",
+    "update",
+    "audit",
+    "compatibility",
+    "permissions"
+  ],
+  "suggestedPrompts": [
+    "展示 Update Guard 更新状态卡片，查看近期版本与权限配置变更",
+    "使用 /update-audit 评估最近几个版本的权限预设、沙箱与模型可用性变化",
+    "使用 /update-audit 对比本机 builtin 内置技能与默认配置快照差异"
+  ]
+}

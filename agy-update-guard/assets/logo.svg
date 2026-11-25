@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" fill="none">
+  <!-- Transparent background with >= 15px margin around artwork including stroke -->
+  <path
+    d="M64 18L102 32V62C102 85.5 85.8 103.0 64 110C42.2 103.0 26 85.5 26 62V32L64 18Z"
+    fill="#0EA5E9"
+    fill-opacity="0.16"
+    stroke="#0284C7"
+    stroke-width="6"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M64 26L94 37.5V61.5C94 80.5 81.1 94.8 64 100.8C46.9 94.8 34 80.5 34 61.5V37.5L64 26Z"
+    stroke="#38BDF8"
+    stroke-width="2.5"
+    stroke-linejoin="round"
+    stroke-opacity="0.7"
+  />
+  <!-- Radar arcs -->
+  <path
+    d="M47 64C47 54.61 54.61 47 64 47C73.39 47 81 54.61 81 64"
+    stroke="#0EA5E9"
+    stroke-width="5"
+    stroke-linecap="round"
+  />
+  <path
+    d="M53.5 64C53.5 58.20 58.20 53.5 64 53.5C69.80 53.5 74.5 58.20 74.5 64"
+    stroke="#10B981"
+    stroke-width="5"
+    stroke-linecap="round"
+  />
+  <!-- Radar sweep hand & core pulse -->
+  <path
+    d="M64 64L77 51"
+    stroke="#10B981"
+    stroke-width="4.5"
+    stroke-linecap="round"
+  />
+  <circle cx="64" cy="64" r="5.5" fill="#10B981" stroke="#065F46" stroke-width="2" />
+  <circle cx="77" cy="51" r="4" fill="#F59E0B" />
+</svg>

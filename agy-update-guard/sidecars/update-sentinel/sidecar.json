@@ -1,0 +1,12 @@
+{
+  "display_name": "Update Guard Sentinel",
+  "description": "每 4 小时后台检测官方 Changelog、模型生命周期与本机内置扩展配置差异，写入应用内待审提醒，零 Token 消耗、零系统弹窗。",
+  "builtin": "schedule",
+  "args": [
+    "CRON_TZ=Asia/Shanghai 15 */4 * * *",
+    "python",
+    "sentinel.py",
+    "--check"
+  ],
+  "restart_policy": "always"
+}
