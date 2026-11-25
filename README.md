@@ -11,6 +11,7 @@
 | [codex-obsidian-open](codex-obsidian-open/README.md) | 在 Codex 中通过文件链接打开 Obsidian 笔记。 |
 | [antigravity-chat-editor](antigravity-chat-editor/README.md) | 在 Antigravity 聊天气泡中编辑 AI 回复，渲染 Markdown，并将修改后的内容用于后续模型请求；支持压缩摘要后的续聊。 |
 | [antigravity-fork](antigravity-fork/README.md) | 打开 Antigravity 内置的会话 Fork 与历史回复 Fork 入口，沿用原生菜单和工作区行为。 |
+| [agy-update-guard](agy-update-guard/README.md) | 零额度监控 Antigravity 更新与内置配置快照差异，通过应用内消息横幅与 MCP App 卡片一键新建对话评估权限与兼容性。 |
 
 ## Antigravity AI 回复编辑器
 
