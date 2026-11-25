@@ -8,7 +8,7 @@ function clearTextCache(part) {
 const done = step => step.status === 'CORTEX_STEP_STATUS_DONE';
 const textParts = body => [...(body.request?.contents || []), body.request?.systemInstruction]
   .filter(Boolean).flatMap(content => (content.parts || []).filter(part => typeof part.text === 'string'));
-function summaryOccurrences(text, summary) {
+function summaryOccurrences(text, summary, exactOnly = false) {
   if (!summary) return [];
   // Native compaction is an initial, dedicated context envelope. Never rewrite
   // a later user message merely because it quotes the same summary text.
@@ -16,18 +16,33 @@ function summaryOccurrences(text, summary) {
   if (!envelope) return [];
   let start = text.indexOf('<CONTEXT_SUMMARY>') + '<CONTEXT_SUMMARY>'.length;
   let end = envelope[0].lastIndexOf('</CONTEXT_SUMMARY>');
+  const preamble = '\nThe following is a summary of the conversation history that has been truncated to fit within the context window:\n\n';
+  if (text.startsWith(preamble, start)) start += preamble.length;
+  const exactIndex = text.indexOf(summary, start);
+  if (text.slice(start, end).trim() === summary.trim() && exactIndex >= start && exactIndex + summary.length <= end) return [exactIndex];
+  if (exactOnly) return [];
   const heading = '# Previous Session Summary:\n', headingAt = text.indexOf(heading, start);
-  if (headingAt >= start && headingAt < end) {
+  if (headingAt >= start && headingAt < end && text.slice(start, headingAt).trim() === '') {
     start = headingAt + heading.length;
     const logs = text.lastIndexOf('\n\n# Conversation Logs', end);
     if (logs >= start) end = logs;
-  } else {
+  }
+  // Check the complete native field first: sessionSummary itself can contain
+  // <summary> tags, including an unclosed tag when native output was truncated.
+  const field = text.slice(start, end);
+  if (field.trim() === summary.trim()) {
+    const index = text.indexOf(summary, start);
+    return index >= start && index + summary.length <= end ? [index] : [];
+  }
+  {
     const open = text.indexOf('<summary>', start), close = text.lastIndexOf('</summary>', end);
-    if (open >= start && close > open && close < end) { start = open + '<summary>'.length; end = close; }
+    if (text.slice(start, open).trim() === '' && open >= start && close > open && close < end &&
+        text.slice(close + '</summary>'.length, end).trim() === '') {
+      start = open + '<summary>'.length; end = close;
+    }
   }
   // Compare the complete summary field, never a substring of another checkpoint.
-  const field = text.slice(start, end);
-  if (field.trim() !== summary.trim()) return [];
+  if (text.slice(start, end).trim() !== summary.trim()) return [];
   const index = text.indexOf(summary, start);
   return index >= start && index + summary.length <= end ? [index] : [];
 }
@@ -101,7 +116,10 @@ function buildEditPlan(steps, rules, body) {
   });
   // Match the checkpoint actually present in this request, not a newer checkpoint
   // which may have appeared while the request was being assembled.
-  const current = checkpoints.findLast(cp => parts.some(part => summaryOccurrences(part.text, cp.summary).length));
+  // Prefer a complete native field over an interpretation of its heading or
+  // wrapper, even if the shorter interpretation matches a newer checkpoint.
+  const current = checkpoints.findLast(cp => parts.some(part => summaryOccurrences(part.text, cp.summary, true).length)) ||
+    checkpoints.findLast(cp => parts.some(part => summaryOccurrences(part.text, cp.summary).length));
   if (!current) return { rules: located.map(({ rule }) => refreshRule(steps, rule)) };
   const covered = located.filter(item => item.index < current.end);
   const direct = located.filter(item => item.index >= current.end).map(({ rule }) => refreshRule(steps, rule, current.end));

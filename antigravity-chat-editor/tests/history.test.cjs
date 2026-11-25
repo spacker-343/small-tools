@@ -10,6 +10,39 @@ const request = summary => ({ requestId: 'agent/' + ID + '/turn', request: { lab
   cachedContent: 'old-cache', contents: [{ role: 'user', parts: [{ text: '<CONTEXT_SUMMARY>' + summary + '</CONTEXT_SUMMARY>' }] },
     { role: 'user', parts: [{ text: 'Continue the task.' }] }] } });
 
+test('recognizes native summary preamble and preserves checkpoint summary tags', () => {
+  for (const summary of ['<summary>native summary</summary>', '<summary>truncated native summary']) {
+    const body = request('unused');
+    body.request.contents[0].parts[0].text = '<CONTEXT_SUMMARY>\nThe following is a summary of the conversation history that has been truncated to fit within the context window:\n\n' + summary + '\n</CONTEXT_SUMMARY>';
+    const plan = buildEditPlan([assistant('a', 'old'), checkpoint(summary, 1)], [rule('a', 'old', 'new')], body);
+    assert.equal(plan.rules.length, 0);
+    assert.equal(plan.compaction.originalSummary, summary);
+    applyRebuiltSummary(body, plan.compaction, 'corrected');
+    assert.ok(body.request.contents[0].parts[0].text.includes('corrected'));
+    assert.ok(!body.request.contents[0].parts[0].text.includes(summary));
+  }
+});
+
+test('does not match a checkpoint quoted inside unrelated summary prose', () => {
+  const body = request('unrelated prefix <summary>old summary</summary> unrelated suffix');
+  const plan = buildEditPlan([assistant('a', 'old'), checkpoint('old summary', 1)], [rule('a', 'old', 'new')], body);
+  assert.equal(plan.compaction, undefined);
+  const quotedHeading = request('user quotation\n# Previous Session Summary:\nold summary');
+  assert.equal(buildEditPlan([assistant('a', 'old'), checkpoint('old summary', 1)],
+    [rule('a', 'old', 'new')], quotedHeading).compaction, undefined);
+});
+
+test('a complete checkpoint field wins over newer heading or wrapper substrings', () => {
+  for (const summary of ['# Previous Session Summary:\nabc', '<summary>abc</summary>']) {
+    const body = request(summary);
+    const steps = [assistant('a', 'old'), checkpoint(summary, 1), checkpoint('abc', 2)];
+    const plan = buildEditPlan(steps, [rule('a', 'old', 'new')], body);
+    assert.equal(plan.compaction.checkpoint, 1);
+    applyRebuiltSummary(body, plan.compaction, 'corrected');
+    assert.ok(!body.request.contents[0].parts[0].text.includes(summary));
+  }
+});
+
 test('rebuild plan applies edits before summarization and does not reuse an unsafe summary', () => {
   const steps = [assistant('a', 'OLD_UNIQUE_MARKER'), checkpoint('STALE_SUMMARY', 1), assistant('b', 'recent')];
   const before = structuredClone(steps);
@@ -84,7 +117,7 @@ test('a user quote never selects or rewrites a checkpoint summary', () => {
 test('checkpoint summaries that contain one another are matched as complete fields', () => {
   const steps = [assistant('a', 'old'), checkpoint('abcdef', 1), checkpoint('abc', 2)];
   const body = request('abcdef');
-  body.request.contents[0].parts[0].text = '<CONTEXT_SUMMARY>\nNative preamble\n# Previous Session Summary:\nabcdef\n\n# Conversation Logs\nlogs\n</CONTEXT_SUMMARY>';
+  body.request.contents[0].parts[0].text = '<CONTEXT_SUMMARY>\nThe following is a summary of the conversation history that has been truncated to fit within the context window:\n\n# Previous Session Summary:\nabcdef\n\n# Conversation Logs\nlogs\n</CONTEXT_SUMMARY>';
   const plan = buildEditPlan(steps, [rule('a', 'old', 'new')], body);
   assert.equal(plan.compaction.checkpoint, 1);
   applyRebuiltSummary(body, plan.compaction, 'corrected');
