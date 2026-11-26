@@ -1,4 +1,5 @@
 import { renderMarkdown } from './markdown.js';
+import { responseId } from './identity.cjs';
 export { renderMarkdown } from './markdown.js';
 
 export function findResponse(element, index) {
@@ -7,12 +8,13 @@ export function findResponse(element, index) {
     function inspect(value, depth = 0) {
       if (!value || typeof value !== 'object' || depth > 5 || seen.has(value)) return null;
       seen.add(value);
-      if (value.step?.case === 'plannerResponse' && value.step.value?.response && value.step.value.messageId &&
+      const messageId = value.step?.case === 'plannerResponse' && responseId(value.step.value, value.metadata);
+      if (messageId && value.step.value?.response &&
           value.status === 3 && value.metadata?.sourceTrajectoryStepInfo?.stepIndex === index) {
         const source = value.metadata.sourceTrajectoryStepInfo;
         const view = element.closest('[data-testid="conversation-view"], [data-testid="subagent-tab-conversation"], [data-testid="side-question-tab-conversation"]');
         const route = /^\/c\/([0-9a-f-]{36})/.exec(element.ownerDocument.defaultView.location.pathname)?.[1];
-        return { index, messageId: value.step.value.messageId, original: value.step.value.response,
+        return { index, messageId, original: value.step.value.response,
           ...(source.cascadeId && { cascadeId: source.cascadeId }), ...(source.trajectoryId && { trajectoryId: source.trajectoryId }),
           ...((view?.dataset.cascadeId || route) && { viewCascadeId: view?.dataset.cascadeId || route }) };
       }

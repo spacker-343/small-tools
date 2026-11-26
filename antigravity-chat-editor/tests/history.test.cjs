@@ -10,6 +10,21 @@ const request = summary => ({ requestId: 'agent/' + ID + '/turn', request: { lab
   cachedContent: 'old-cache', contents: [{ role: 'user', parts: [{ text: '<CONTEXT_SUMMARY>' + summary + '</CONTEXT_SUMMARY>' }] },
     { role: 'user', parts: [{ text: 'Continue the task.' }] }] } });
 
+test('native content identity supports direct rewriting and survives compaction', () => {
+  const step = { status: 'CORTEX_STEP_STATUS_DONE', metadata: { modelApiContentId: 'native-content-a' },
+    plannerResponse: { response: 'OLD_NATIVE_REPLY' } };
+  const edit = rule('content:native-content-a', 'OLD_NATIVE_REPLY', '**EDITED_NATIVE_REPLY**');
+  const direct = buildEditPlan([step], [edit], request('unrelated'));
+  const body = { requestId: 'agent/' + ID + '/turn', request: { contents: [{ role: 'model', parts: [{ text: 'OLD_NATIVE_REPLY' }] }] } };
+  require('../proxy.cjs').rewriteRequest(body, direct.rules);
+  assert.equal(body.request.contents[0].parts[0].text, '**EDITED_NATIVE_REPLY**');
+  const compacted = buildEditPlan([step, checkpoint('OLD_SUMMARY', 1)], [edit], request('OLD_SUMMARY'));
+  assert.deepEqual(compacted.compaction.records, [{ step: 0, kind: 'assistant', messageId: 'content:native-content-a',
+    edited: true, text: '**EDITED_NATIVE_REPLY**' }]);
+  const ambiguous = { ...step, plannerResponse: { response: 'OLD_NATIVE_REPLY' } };
+  assert.throws(() => buildEditPlan([step, ambiguous], [edit], request('unrelated')), /无法可靠应用/);
+});
+
 test('recognizes native summary preamble and preserves checkpoint summary tags', () => {
   for (const summary of ['<summary>native summary</summary>', '<summary>truncated native summary']) {
     const body = request('unused');

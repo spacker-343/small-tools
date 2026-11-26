@@ -54,6 +54,13 @@ test('accepts a live /c/id chat, persists an edit, and never quits the app', asy
     const reverted = await handler(event, { action: 'save', request: { index: 0, cascadeId: ID,
       messageId: 'bot-a', original: 'original', text: 'original' } });
     assert.equal(reverted.rules.length, 0);
+    steps.push({ status: 'CORTEX_STEP_STATUS_DONE', metadata: { modelApiContentId: 'native-content-a' },
+      plannerResponse: { response: 'native reply without messageId' } });
+    const native = await handler(event, { action: 'save', request: { index: 1, cascadeId: ID, viewCascadeId: ID,
+      messageId: 'content:native-content-a', original: 'native reply without messageId', text: '**edited native reply**' } });
+    assert.equal(native.rules[0].messageId, 'content:native-content-a');
+    assert.equal(native.rules[0].text, '**edited native reply**');
+    assert.equal(quit, false);
     const duplicate = id => ({ status: 'CORTEX_STEP_STATUS_DONE', plannerResponse: { messageId: id, response: 'original' } });
     const refreshed = module.exports.refreshRule([duplicate('bot-a'), duplicate('bot-b'), duplicate('bot-c')],
       { cascadeId: ID, messageId: 'bot-a', original: 'original', text: 'edited', occurrence: 0, matchCount: 2 });

@@ -1,5 +1,6 @@
 'use strict';
 const crypto = require('node:crypto');
+const { responseId } = require('./identity.cjs');
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
 function clearTextCache(part) {
   for (const key of ['thoughtSignature', 'thought_signature', 'id', 'cacheControl', 'cache_control',
@@ -53,7 +54,7 @@ function summaryParts(body) {
 
 function locate(steps, rule) {
   const found = steps.map((step, index) => ({ step, index })).filter(({ step }) => done(step) &&
-    step.plannerResponse?.messageId === rule.messageId && step.plannerResponse.response === rule.original);
+    responseId(step.plannerResponse, step.metadata) === rule.messageId && step.plannerResponse?.response === rule.original);
   if (found.length !== 1) throw new Error('编辑的原始回复已变化，无法可靠应用修改；请重新保存该条编辑');
   return found[0].index;
 }
@@ -82,9 +83,9 @@ function historyRecords(steps, rules, start, end, safeSummary) {
     if (!step || !['CORTEX_STEP_STATUS_DONE', 'CORTEX_STEP_STATUS_ERROR', 'CORTEX_STEP_STATUS_CANCELED',
       'CORTEX_STEP_STATUS_INTERRUPTED', 'CORTEX_STEP_STATUS_HALTED'].includes(step.status) || step.checkpoint) continue;
     if (step.plannerResponse) {
-      const value = step.plannerResponse, edit = edits.get(value.messageId);
+      const value = step.plannerResponse, messageId = responseId(value, step.metadata), edit = edits.get(messageId);
       const text = edit?.text ?? value.response;
-      if (text) records.push({ step: index, kind: 'assistant', messageId: value.messageId, edited: !!edit, text });
+      if (text) records.push({ step: index, kind: 'assistant', messageId, edited: !!edit, text });
       for (const call of value.toolCalls || []) records.push({ step: index, kind: 'tool-call', data: clipped(call) });
     } else if (step.userInput) {
       const value = step.userInput;

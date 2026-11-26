@@ -5,6 +5,7 @@ const path = require('node:path');
 const https = require('node:https');
 const { createProxy } = require('./proxy.cjs');
 const { buildEditPlan, refreshRule } = require('./history.cjs');
+const { responseId } = require('./identity.cjs');
 const LOCAL = path.join(__dirname, '.local');
 const EDITS = path.join(LOCAL, 'edits.json');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -90,7 +91,7 @@ function start(languageServer) {
     try {
       await activate(); const steps = await getSteps(cascadeId);
       const matches = steps.map((step, index) => ({ step, index })).filter(({ step }) =>
-        step.plannerResponse?.messageId === input.messageId && step.plannerResponse?.response === input.original);
+        responseId(step.plannerResponse, step.metadata) === input.messageId && step.plannerResponse?.response === input.original);
       if (matches.length !== 1 || matches[0].step.status !== 'CORTEX_STEP_STATUS_DONE') throw new Error('消息已变化或尚未完成，请重新打开编辑器');
       const target = matches[0].index;
       const segment = steps.slice(0, target).findLastIndex(step => step.checkpoint) + 1;

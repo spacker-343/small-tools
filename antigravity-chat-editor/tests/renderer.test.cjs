@@ -15,7 +15,7 @@ test('reads Markdown and identity from the correct React owner', () => {
   const previousWindow = global.window, previousDocument = global.document;
   global.window = dom.window; global.document = dom.window.document;
   try {
-    const step = { status: 3, metadata: { sourceTrajectoryStepInfo: { stepIndex: 7 } },
+    const step = { status: 3, metadata: { modelApiContentId: 'content-also-present', sourceTrajectoryStepInfo: { stepIndex: 7 } },
       step: { case: 'plannerResponse', value: { response: '**原始**\n\n代码', messageId: 'bot-a' } } };
     function Response({ step }) {
       return React.createElement('div', { 'data-bubble-side': 'agent', 'data-step-index': 7 }, '原始 代码');
@@ -117,4 +117,44 @@ test('supports plain sidebar messages and keeps main and child identities separa
   await new Promise(resolve => setTimeout(resolve, 0));
   w.dispatchEvent(new w.Event('pagehide'));
   w.close();
+});
+
+test('edits a completed native reply without messageId using its content identity', async () => {
+  const id = '11111111-1111-4111-8111-111111111111', contentId = 'native-content-a';
+  const dom = new JSDOM('<div data-testid="conversation-view" data-cascade-id="' + id + '"><div data-step-index="3">native reply</div></div>',
+    { pretendToBeVisual: true, runScripts: 'outside-only' });
+  const w = dom.window, calls = [], bubble = w.document.querySelector('[data-step-index]');
+  bubble.__reactFiber$test = { memoizedProps: { step: { status: 3,
+    metadata: { modelApiContentId: contentId, sourceTrajectoryStepInfo: { stepIndex: 3, cascadeId: id } },
+    step: { case: 'plannerResponse', value: { response: '**native** reply', modifiedResponse: '**native** reply' } } } } };
+  w.agyChatEditor = { invoke: async data => {
+    calls.push(data);
+    return { rules: data.action === 'save' ? [{ key: id + '/content:' + contentId, text: data.request.text }] : [] };
+  } };
+  try {
+    w.eval(script); await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(findResponse(bubble, 3).messageId, 'content:' + contentId);
+    bubble.querySelector('.agy-edit-button').click();
+    const textarea = bubble.querySelector('textarea');
+    assert.equal(textarea.value, '**native** reply');
+    textarea.value = '**updated** reply';
+    await bubble.querySelector('.agy-edit-dialog button').onclick();
+    assert.equal(calls.find(call => call.action === 'save').request.messageId, 'content:' + contentId);
+    assert.equal(bubble.querySelector('.agy-markdown strong').textContent, 'updated');
+  } finally { w.dispatchEvent(new w.Event('pagehide')); w.close(); }
+});
+
+test('keeps replies without any stable native identity or still generating uneditable', async () => {
+  const dom = new JSDOM('<div data-step-index="3"></div>', { pretendToBeVisual: true, runScripts: 'outside-only' });
+  const w = dom.window, bubble = w.document.querySelector('div');
+  w.agyChatEditor = { invoke: async () => ({ rules: [] }) };
+  const step = { status: 3, metadata: { sourceTrajectoryStepInfo: { stepIndex: 3 } },
+    step: { case: 'plannerResponse', value: { response: 'native reply' } } };
+  bubble.__reactFiber$test = { memoizedProps: { step } };
+  try {
+    w.eval(script); await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(bubble.querySelector('.agy-edit-button'), null);
+    step.status = 8; step.metadata.modelApiContentId = 'native-content-a';
+    assert.equal(findResponse(bubble, 3), null);
+  } finally { w.dispatchEvent(new w.Event('pagehide')); w.close(); }
 });
