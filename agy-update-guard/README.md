@@ -1,6 +1,6 @@
-# agy-update-guard（Update Guard）v1.1
+# agy-update-guard（Update Guard）v1.2
 
-零额度监控 Antigravity 官方更新、模型可用性变化及本机 `builtin` 内置技能与默认配置快照差异；所有提醒 100% 在 Antigravity 应用内部呈现（无桌面系统弹窗、后台零账号交互），支持在应用内状态卡片或消息引导页一键新建对话完成版本兼容性与工作区权限评估。
+零额度监控 Antigravity 官方更新、本机待安装安装包对 **`antigravity-fork` & `antigravity-chat-editor`** 的补丁兼容性、新版本**外审模型与安全护栏（`PolicyGuardian` / `PolicyProctor` / `LLMClassifier` / 本地 Skill 扫描过滤）**二进制差异及本机 `builtin` 快照变动；所有提醒 100% 在 Antigravity 应用内部呈现（无桌面系统弹窗、后台零账号交互），支持一键新建对话输出升级安全评级（`HOLD` / `CAUTION` / `SAFE`）。
 
 ## 核心能力与工作流
 

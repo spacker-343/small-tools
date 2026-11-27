@@ -109,6 +109,19 @@ if (-not $UseJunction) {
 }
 
 Write-Host "[3/4] Initializing zero-quota baseline..."
+$DataDir = Join-Path $HOME '.gemini\antigravity\plugin_data\agy-update-guard'
+if (-not (Test-Path -LiteralPath $DataDir)) {
+    New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+}
+$ToolsRoot = Split-Path -Parent $NormSource
+$CompanionCfg = @{
+    tools_root      = $ToolsRoot
+    chat_editor_dir = (Join-Path $ToolsRoot 'antigravity-chat-editor')
+    fork_dir        = (Join-Path $ToolsRoot 'antigravity-fork')
+}
+$CompanionJson = $CompanionCfg | ConvertTo-Json -Depth 3
+[System.IO.File]::WriteAllText((Join-Path $DataDir 'companion_paths.json'), $CompanionJson, [System.Text.UTF8Encoding]::new($false))
+
 $SentinelScript = Join-Path $TargetDir 'sidecars\update-sentinel\sentinel.py'
 & python $SentinelScript --init-baseline
 if ($LASTEXITCODE -ne 0) {

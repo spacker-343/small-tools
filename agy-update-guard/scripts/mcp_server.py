@@ -22,6 +22,7 @@ for _p in (SCRIPTS_DIR, SENTINEL_DIR):
         sys.path.insert(0, str(_p))
 
 import sentinel  # noqa: E402
+import update_blocker  # noqa: E402
 
 
 def _resolve_data_dir(cli_data_dir: str | None = None) -> Path:
@@ -140,6 +141,27 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": {
                 "type": "object",
                 "properties": {},
+                "additionalProperties": False,
+            },
+            "_meta": {
+                "ui": {"visibility": ["app"]},
+            },
+        },
+        {
+            "name": "app_set_update_lock",
+            "title": "Toggle Auto-Update Lock",
+            "description": (
+                "App-only tool to purge cached installers and lock or unlock Antigravity auto-updates."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "locked": {
+                        "type": "boolean",
+                        "description": "True to purge pending installers and block updates; false to restore.",
+                    }
+                },
+                "required": ["locked"],
                 "additionalProperties": False,
             },
             "_meta": {
@@ -334,6 +356,28 @@ class UpdateGuardMcpServer:
             payload["ack_result"] = ack
             return {
                 "content": [{"type": "text", "text": f"已确认当前版本提醒。\n{_format_text_summary(payload)}"}],
+                "structuredContent": payload,
+            }
+
+        if name == "app_set_update_lock":
+            want_locked = bool(args.get("locked", True))
+            lock_res = (
+                update_blocker.lock_updates(self.data_dir)
+                if want_locked
+                else update_blocker.unlock_updates(self.data_dir)
+            )
+            payload = sentinel.collect_guard_structured_content(
+                data_dir=self.data_dir,
+                refresh=False,
+                include_latest=True,
+                changelog_url=self.changelog_url,
+                models_url=self.models_url,
+                builtin_dir=self.builtin_dir,
+            )
+            payload["update_lock"] = lock_res
+            action_txt = "已锁定自动更新并清理本地安装包" if want_locked else "已解除自动更新锁定"
+            return {
+                "content": [{"type": "text", "text": f"{action_txt}。\n{_format_text_summary(payload)}"}],
                 "structuredContent": payload,
             }
 

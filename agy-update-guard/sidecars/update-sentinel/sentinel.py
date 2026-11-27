@@ -27,6 +27,8 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import builtin_snapshot  # noqa: E402
+import local_inspector  # noqa: E402
+import update_blocker  # noqa: E402
 
 CHANGELOG_URL = "https://antigravity.google/docs/changelog.md"
 MODELS_URL = "https://antigravity.google/docs/models.md"
@@ -66,6 +68,15 @@ RISK_RULES: dict[str, tuple[str, ...]] = {
         "origin block",
         "sandboxproxy",
     ),
+    "guardian_classifier_change": (
+        "policyguardian",
+        "policyproctor",
+        "proctor",
+        "llmclassifier",
+        "classifytrajectory",
+        "skillscanmode",
+        "filterblockedskills",
+    ),
     "telemetry_upload": (
         "telemetry",
         "diagnostic upload",
@@ -84,9 +95,15 @@ HIGH_RISK_KEYWORDS = {
     "non-workspace",
     "sandbox",
     "permission",
+    "policyguardian",
+    "policyproctor",
+    "proctor",
+    "llmclassifier",
 }
 
 DIM_LABELS_ZH: dict[str, str] = {
+    "local_patch_compat": "Fork/Edit 补丁兼容",
+    "guardian_classifier_change": "外审与安全护栏强化",
     "permission_sandbox": "权限与沙箱",
     "model_safety_or_deprecation": "模型可用性与下架",
     "browser_network": "浏览器与网络",
@@ -471,24 +488,105 @@ def _build_local_env_lines(
     return lines
 
 
+def _build_local_probe_lines(local_probe: dict[str, Any] | None) -> list[str]:
+    """Build markdown lines summarizing local Fork/Edit patch checks and Guardian binary diffs."""
+    if not local_probe:
+        return ["- 本地补丁与二进制预检：未执行（当前无待安装更新包或未启用本地探测）。"]
+
+    cur_state = local_probe.get("current_patch_state") or {}
+    lines: list[str] = []
+    if cur_state.get("checked"):
+        ce_cur = "已安装" if cur_state.get("chat_editor_installed") else "未安装/原版"
+        lines.append(
+            f"- 当前已安装客户端补丁状态：`antigravity-chat-editor` = `{ce_cur}`（客户端升级会覆盖 `app.asar` 与 `language_server.exe`，升级后需重新恢复补丁）。"
+        )
+
+    if not local_probe.get("has_pending_probe"):
+        err = str(local_probe.get("probe_error") or "").strip()
+        if err:
+            lines.append(f"- ⚠️ 待安装更新包只读解包探测异常：`{err}`（建议在审查对话中结合只读工具人工复核）。")
+        else:
+            lines.append(
+                "- 待安装更新包实测状态：当前本地尚未下载 `pending/*.exe` 安装包，暂无法做新版本二进制实测；请先基于下方 Changelog / Models / Builtin 评估，待安装包下载后可刷新卡片自动实测。"
+            )
+        return lines
+
+    target_ver = local_probe.get("target_version") or "pending"
+    ce = local_probe.get("chat_editor") or {}
+    fk = local_probe.get("fork_patch") or {}
+    gd = local_probe.get("guardian_diff") or {}
+
+    ce_flag = "✅ 兼容" if ce.get("compatible") is True else ("❌ 不兼容" if ce.get("compatible") is False else "⚪ 未确认")
+    fk_flag = "✅ 兼容" if fk.get("compatible") is True else ("❌ 不兼容" if fk.get("compatible") is False else "⚪ 未确认")
+    lines.append(
+        f"- **待安装版本 (`v{target_ver}`) `antigravity-chat-editor` 实测**: {ce_flag} — {ce.get('summary', '')}"
+    )
+    if ce.get("output"):
+        lines.append(f"  - 检查输出: `{str(ce['output']).replace(chr(10), ' | ')}`")
+    lines.append(
+        f"- **待安装版本 (`v{target_ver}`) `antigravity-fork` 实测**: {fk_flag} — {fk.get('summary', '')}"
+    )
+    if fk.get("output"):
+        lines.append(f"  - 构建输出: `{str(fk['output']).replace(chr(10), ' | ')}`")
+
+    cc_ok = gd.get("cloudcode_url_present", True)
+    lines.append(
+        f"- **`SetCloudCodeURL` 本地请求转发接口检查**: `{'保留（可用）' if cc_ok else '❌ 已移除或改名（chat-editor 转发链路将失效！）'}`"
+    )
+
+    if gd.get("compared"):
+        lines.append(
+            f"- **外审与安全护栏二进制对比 (`v{gd.get('baseline_version')}` → `v{gd.get('target_version')}` `language_server.exe`)**: "
+            f"新增相关符号 `{gd.get('total_added_count', 0)}` 条，移除 `{gd.get('total_removed_count', 0)}` 条，强度升级判定=`{gd.get('escalated', False)}`"
+        )
+        if gd.get("proctor_skill_notice_added"):
+            lines.append(
+                "  - 🛑 检测到新增 `[PROCTOR SKILL SECURITY NOTICE]`（本地自定义 Skill 安全扫描警告标记）！"
+            )
+        cat_hits = gd.get("category_hits") or {}
+        for cat, samples in cat_hits.items():
+            zh = local_inspector.CATEGORY_LABELS_ZH.get(cat, cat)
+            lines.append(f"  - 命中新增子类别 **{zh}** (`+{len(samples)}+`): `{', '.join(samples[:8])}`")
+        if gd.get("sample_added"):
+            lines.append("  - 代表性新增审查/分类符号样本:")
+            for sym in gd["sample_added"][:25]:
+                lines.append(f"    - `{sym}`")
+    return lines
+
+
 def _refresh_prompt_local_env(
     prompt_text: str,
     local_exe: dict[str, str],
     pending_updater: dict[str, Any],
+    local_probe: dict[str, Any] | None = None,
 ) -> str:
-    """Refresh the '## 本机客户端环境' section inside a cached review prompt."""
-    if not prompt_text or "## 本机客户端环境" not in prompt_text:
+    """Refresh local environment and binary probe sections inside a cached review prompt."""
+    if not prompt_text:
         return prompt_text
-    replacement = "## 本机客户端环境\n" + "\n".join(
-        _build_local_env_lines(local_exe, pending_updater)
-    )
-    return re.sub(
-        r"## 本机客户端环境\r?\n.*?(?=\r?\n\r?\n## |\Z)",
-        lambda _m: replacement,
-        prompt_text,
-        count=1,
-        flags=re.DOTALL,
-    )
+    updated = prompt_text
+    if "## 本机客户端环境" in updated:
+        replacement = "## 本机客户端环境\n" + "\n".join(
+            _build_local_env_lines(local_exe, pending_updater)
+        )
+        updated = re.sub(
+            r"## 本机客户端环境\r?\n.*?(?=\r?\n\r?\n## |\Z)",
+            lambda _m: replacement,
+            updated,
+            count=1,
+            flags=re.DOTALL,
+        )
+    if local_probe is not None and "## 本地补丁与外审二进制实测预检" in updated:
+        probe_replacement = "## 本地补丁与外审二进制实测预检\n" + "\n".join(
+            _build_local_probe_lines(local_probe)
+        )
+        updated = re.sub(
+            r"## 本地补丁与外审二进制实测预检\r?\n.*?(?=\r?\n\r?\n## |\Z)",
+            lambda _m: probe_replacement,
+            updated,
+            count=1,
+            flags=re.DOTALL,
+        )
+    return updated
 
 
 def resolve_data_dir(cli_data_dir: str | Path | None = None) -> Path:
@@ -536,8 +634,9 @@ def prescreen_risks(
     models_diff_text: str,
     models_notices: list[str],
     builtin_diff: dict[str, Any],
+    local_probe: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Run deterministic case-insensitive compatibility pre-screening across 5 dimensions."""
+    """Run deterministic compatibility & guardian escalation pre-screening."""
     corpus_parts: list[str] = []
     for entries in new_versions_by_product.values():
         for entry in entries:
@@ -552,11 +651,39 @@ def prescreen_risks(
     matched_dimensions: list[str] = []
     matched_keywords: dict[str, list[str]] = {}
 
+    if local_probe and local_probe.get("has_pending_probe"):
+        ce = local_probe.get("chat_editor") or {}
+        fk = local_probe.get("fork_patch") or {}
+        gd = local_probe.get("guardian_diff") or {}
+        patch_issues: list[str] = []
+        if ce.get("compatible") is False:
+            patch_issues.append("chat_editor_incompatible")
+        if fk.get("compatible") is False:
+            patch_issues.append("fork_patch_incompatible")
+        if gd.get("cloudcode_url_present") is False:
+            patch_issues.append("SetCloudCodeURL_missing")
+        if patch_issues:
+            matched_dimensions.append("local_patch_compat")
+            matched_keywords["local_patch_compat"] = patch_issues
+
+        if gd.get("escalated"):
+            matched_dimensions.append("guardian_classifier_change")
+            cat_hits = gd.get("category_hits") or {}
+            guardian_tags = [f"{k}(+{len(v)})" for k, v in cat_hits.items()]
+            if gd.get("proctor_skill_notice_added"):
+                guardian_tags.append("proctor_skill_security_notice")
+            guardian_tags.append(f"added_symbols={gd.get('total_added_count', 0)}")
+            matched_keywords["guardian_classifier_change"] = guardian_tags
+
     for dim, keywords in RISK_RULES.items():
         hits = [kw for kw in keywords if kw in combined_lower]
         if hits:
-            matched_dimensions.append(dim)
-            matched_keywords[dim] = hits
+            if dim not in matched_dimensions:
+                matched_dimensions.append(dim)
+            existing = matched_keywords.setdefault(dim, [])
+            for h in hits:
+                if h not in existing:
+                    existing.append(h)
 
     if builtin_diff.get("has_changes"):
         if "builtin_prompt_change" not in matched_dimensions:
@@ -573,7 +700,9 @@ def prescreen_risks(
         for kw in kws
     )
     if (
-        "builtin_prompt_change" in matched_dimensions
+        "local_patch_compat" in matched_dimensions
+        or "guardian_classifier_change" in matched_dimensions
+        or "builtin_prompt_change" in matched_dimensions
         or "browser_network" in matched_dimensions
         or ("permission_sandbox" in matched_dimensions and has_high_risk_kw)
         or len(matched_dimensions) >= 2
@@ -585,7 +714,11 @@ def prescreen_risks(
         verdict = "SAFE"
 
     if not matched_dimensions:
-        fallback_headline = "未命中权限策略或内置配置重大变更"
+        fallback_headline = "Fork/Edit 兼容且未见外审或权限强化"
+    elif "local_patch_compat" in matched_dimensions:
+        fallback_headline = "警告：待安装新版本与 Fork/Edit 补丁不兼容"
+    elif "guardian_classifier_change" in matched_dimensions:
+        fallback_headline = "警告：待安装版本检测到外审与安全护栏强化"
     else:
         zh_names = [DIM_LABELS_ZH.get(d, d) for d in matched_dimensions]
         if len(zh_names) > 2:
@@ -681,15 +814,20 @@ def build_audit_prompt(
     models_diff_text: str,
     builtin_diff: dict[str, Any],
     prescreen: dict[str, Any],
+    local_probe: dict[str, Any] | None = None,
 ) -> str:
-    """Build a self-contained engineering compatibility review prompt requiring zero tool calls."""
+    """Build a targeted review prompt evaluating Fork/Edit compatibility and Guardian/classifier changes."""
     lines: list[str] = [
         f"Audit-Run-ID: {run_id}",
         "",
-        "你是 Antigravity 版本更新与工作区权限兼容性评估助手。**请仅基于下方提供的采集材料直接分析输出，不要调用任何联网、终端、读文件或子代理工具。**",
+        "你是 Antigravity 升级安全评级助手，核心任务是在升级前评估：**① 本机自研补丁 `antigravity-fork` 与 `antigravity-chat-editor` 是否兼容、② 新版本外审模型与安全护栏（`PolicyGuardian` / `PolicyProctor` / `LLMClassifier` / 本地 Skill 扫描过滤）是否变强、③ 工作区权限与模型上下架影响**。",
+        "若下方已包含完整的待安装安装包解包实测与二进制对比证据，请直接基于证据深入分析输出；若存在未决疑点需核对本地补丁代码或二进制细节，允许调用只读工具进一步核实（严禁修改安装目录或执行安装操作）。",
         "",
         "## 本机客户端环境",
         *_build_local_env_lines(local_exe, pending_updater),
+        "",
+        "## 本地补丁与外审二进制实测预检",
+        *_build_local_probe_lines(local_probe),
     ]
 
     lines.extend(
@@ -737,11 +875,14 @@ def build_audit_prompt(
         [
             "",
             "## 评估输出要求",
-            "请严格围绕以下 4 项输出结构化中文兼容性评估：",
-            "1. **版本更新与修复摘要**：概括新增特性、交互调整与问题修复。",
-            "2. **工作区权限、终端沙箱与配置兼容性评估**：检查 `Auto` 审批策略、跨工作区文件读写范围、终端沙箱行为、浏览器访问策略、诊断上传及模型可用性/下架计划，说明对日常自动化脚本与多目录开发工作流的兼容性影响。",
-            "3. **生效范围区分**：客观区分【客户端本地版本变更（随客户端安装包生效）】与【云端模型及服务端配置变更（与本地客户端版本无关）】。",
-            "4. **升级建议结论**：明确输出 `HOLD`（建议暂缓升级，待确认工作流兼容性）、`CAUTION`（建议关注变更项后升级）或 `SAFE`（常规功能与修复升级），并在回复末尾保留以下 `[AUDIT_RESULT]` 结构块以便阅读与归档（禁止省略或修改标签名）：",
+            "请严格围绕以下 5 项输出结构化中文安全评级报告：",
+            "1. **本地补丁兼容性评估（`antigravity-fork` & `antigravity-chat-editor`）**：",
+            "   - 核对 `antigravity-fork`（`language_server.exe` 内嵌前端 ZIP、`conversationForkingEnabled` / `conversationForkingHistoricalStep`、`allowForkWithSubagents`）与 `antigravity-chat-editor`（`app.asar` Electron Fuse、`dist/main.js` & `preload.js` 桥接、`SetCloudCodeURL` 本地请求转发接口、Protobuf 描述符、聊天气泡/侧栏 DOM 锚点、压缩摘要重建链路）的解包实测结果及 Changelog 潜在影响，明确说明升级后能否直接恢复补丁。",
+            "2. **外审模型、安全护栏与本地 Skill 扫描强度评估**：",
+            "   - 结合 `language_server.exe` 二进制对比（`PolicyGuardian`、`PolicyProctor`、`LLMClassifier`、`classifyTrajectory` 整条轨迹外审、`AuditPostExecStep` 工具后置审计、`SkillScanMode` / `filterBlockedSkills` 本地技能扫描与封禁、`McpDriftRecord`）、`builtin` 内置技能提示词差异及 `models.md` 变化，**明确判断新版本外审模型与安全审查机制是否变强**，并指出对本地自定义技能（如逆向分析、自动化脚本）及日常工作流的具体风险。",
+            "3. **版本更新、工作区权限与模型生命周期摘要**：概括重点修复、`Auto` 跨目录审批边界、敏感配置文件保护、终端沙箱及模型上下架计划。",
+            "4. **生效范围区分**：客观区分【随本地客户端安装包生效（含新版二进制审查引擎代码与补丁覆盖）】与【随云端服务端实验开关及模型配置生效（如服务端是否下发启用新审查模式、模型下架时间表）】。",
+            "5. **安全评级与升级建议结论**：若 `fork`/`edit` 任一不兼容或检测到外审/Skill 扫描过滤机制实质性增强，明确给出 `HOLD`（建议暂缓重启升级）；存在需留意的非阻断调整给出 `CAUTION`；确认补丁兼容且外审无增强给出 `SAFE`。末尾必须保留以下 `[AUDIT_RESULT]` 结构块（禁止省略或修改标签名）：",
             "```text",
             "[AUDIT_RESULT]",
             "VERDICT: HOLD | CAUTION | SAFE",
@@ -1331,6 +1472,7 @@ def _write_pending_notice_bundle(
     current_builtin: dict[str, Any],
     existing_versions: dict[str, str],
     prompt_text: str,
+    local_probe: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Persist pending_notice.json and snapshots/builtin_pending.json without advancing baseline."""
     latest_versions = _latest_versions_map(parsed_changelog)
@@ -1352,6 +1494,7 @@ def _write_pending_notice_bundle(
         "matched_keywords": prescreen["matched_keywords"],
         "local_exe": local_exe,
         "pending_updater": pending_updater,
+        "local_probe": local_probe or {},
         "latest_versions": latest_versions,
         "new_versions": compact_new,
         "models_info": {
@@ -1415,6 +1558,7 @@ def collect_guard_structured_content(
     notice = load_pending_notice(resolved_data)
     local_exe = get_local_antigravity_version()
     pending_updater = check_pending_updater_files(local_version=local_exe["version"])
+    update_lock = update_blocker.get_update_lock_status(data_dir=resolved_data)
 
     should_refresh = refresh or (state is None and notice is None)
     refresh_error = ""
@@ -1494,12 +1638,19 @@ def collect_guard_structured_content(
                 if (has_any_change or not include_latest)
                 else _collect_new_versions(parsed_changelog, existing_versions, audit_latest=True)
             )
+            local_probe = local_inspector.probe_local_environment(
+                local_exe=local_exe,
+                pending_updater=pending_updater,
+                data_dir=resolved_data,
+                plugin_root=PLUGIN_ROOT,
+            )
             prescreen = prescreen_risks(
                 display_versions,
                 models_changed,
                 models_diff_text,
                 models_info.get("deprecation_notices", []),
                 builtin_diff,
+                local_probe=local_probe,
             )
             if (
                 pending_installer_changed
@@ -1526,6 +1677,7 @@ def collect_guard_structured_content(
                 models_diff_text=models_diff_text,
                 builtin_diff=builtin_diff,
                 prescreen=prescreen,
+                local_probe=local_probe,
             )
 
             if has_any_change:
@@ -1545,6 +1697,7 @@ def collect_guard_structured_content(
                     current_builtin=current_builtin,
                     existing_versions=existing_versions,
                     prompt_text=prompt_text,
+                    local_probe=local_probe,
                 )
                 return {
                     "has_unread_notice": True,
@@ -1560,6 +1713,8 @@ def collect_guard_structured_content(
                     "dimension_labels": prescreen["dimension_labels"],
                     "local_exe": local_exe,
                     "pending_updater": pending_updater,
+                    "update_lock": update_lock,
+                    "local_probe": local_probe,
                     "latest_versions": latest_versions,
                     "new_versions": notice["new_versions"],
                     "models_info": notice["models_info"],
@@ -1587,6 +1742,8 @@ def collect_guard_structured_content(
                 "dimension_labels": prescreen["dimension_labels"],
                 "local_exe": local_exe,
                 "pending_updater": pending_updater,
+                "update_lock": update_lock,
+                "local_probe": local_probe,
                 "latest_versions": latest_versions,
                 "new_versions": _compact_new_versions(display_versions),
                 "models_info": {
@@ -1618,10 +1775,22 @@ def collect_guard_structured_content(
             if local_exe.get("version") != "unknown"
             else (notice.get("local_exe") or local_exe)
         )
+        live_probe = local_inspector.probe_local_environment(
+            local_exe=effective_local_exe,
+            pending_updater=pending_updater,
+            data_dir=resolved_data,
+            plugin_root=PLUGIN_ROOT,
+        )
+        effective_probe = (
+            live_probe
+            if live_probe.get("has_pending_probe") or not notice.get("local_probe")
+            else dict(notice.get("local_probe") or {})
+        )
         refreshed_prompt = _refresh_prompt_local_env(
             str(notice.get("review_prompt", "")),
             effective_local_exe,
             pending_updater,
+            local_probe=effective_probe,
         )
         return {
             "has_unread_notice": not acknowledged,
@@ -1639,6 +1808,8 @@ def collect_guard_structured_content(
             ),
             "local_exe": effective_local_exe,
             "pending_updater": pending_updater,
+            "update_lock": update_lock,
+            "local_probe": effective_probe,
             "latest_versions": dict(notice.get("latest_versions") or (state or {}).get("last_seen_versions") or {}),
             "new_versions": dict(notice.get("new_versions") or {}),
             "models_info": dict(notice.get("models_info") or {}),
@@ -1673,12 +1844,19 @@ def collect_guard_structured_content(
             "current_file_count": current_builtin["file_count"],
         }
     )
+    fallback_probe = local_inspector.probe_local_environment(
+        local_exe=local_exe,
+        pending_updater=pending_updater,
+        data_dir=resolved_data,
+        plugin_root=PLUGIN_ROOT,
+    )
     prescreen = prescreen_risks(
         {},
         False,
         "",
         cached_models_info.get("deprecation_notices", []),
         builtin_diff,
+        local_probe=fallback_probe,
     )
     run_id = str(uuid.uuid4())
     app_ver = cached_versions.get("Antigravity App", "")
@@ -1695,7 +1873,9 @@ def collect_guard_structured_content(
         models_diff_text="",
         builtin_diff=builtin_diff,
         prescreen=prescreen,
+        local_probe=fallback_probe,
     )
+    has_probe_risk = prescreen["verdict"] != "SAFE"
     return {
         "has_unread_notice": False,
         "acknowledged": True,
@@ -1705,11 +1885,13 @@ def collect_guard_structured_content(
         "last_checked_at": str((state or {}).get("last_checked_at") or (state or {}).get("updated_at") or ""),
         "version_label": version_label,
         "verdict": prescreen["verdict"],
-        "headline": "当前处于已确认基线状态" if not builtin_diff.get("has_changes") else prescreen["fallback_headline"],
+        "headline": prescreen["fallback_headline"] if has_probe_risk else "当前处于已确认基线状态",
         "dimensions": prescreen["dimensions"],
         "dimension_labels": prescreen["dimension_labels"],
         "local_exe": local_exe,
         "pending_updater": pending_updater,
+        "update_lock": update_lock,
+        "local_probe": fallback_probe,
         "latest_versions": cached_versions,
         "new_versions": {},
         "models_info": {
@@ -1741,6 +1923,10 @@ def run_sentinel(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         else builtin_snapshot.get_default_builtin_dir()
     )
 
+    if getattr(args, "lock_updates", False):
+        return 0, {"mode": "lock_updates", **update_blocker.lock_updates(data_dir)}
+    if getattr(args, "unlock_updates", False):
+        return 0, {"mode": "unlock_updates", **update_blocker.unlock_updates(data_dir)}
     if getattr(args, "acknowledge", False):
         return 0, acknowledge_pending_notice(data_dir, builtin_dir=builtin_dir)
 
@@ -1858,12 +2044,20 @@ def run_sentinel(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 "pending_updater": pending_updater,
             }
 
+        local_probe = local_inspector.probe_local_environment(
+            local_exe=local_exe,
+            pending_updater=pending_updater,
+            data_dir=data_dir,
+            plugin_root=PLUGIN_ROOT,
+            allow_cache_write=not getattr(args, "dry_run", False),
+        )
         prescreen = prescreen_risks(
             new_versions,
             models_changed,
             models_diff_text,
             models_info.get("deprecation_notices", []),
             builtin_diff,
+            local_probe=local_probe,
         )
         if (
             pending_installer_changed
@@ -1893,6 +2087,7 @@ def run_sentinel(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             models_diff_text=models_diff_text,
             builtin_diff=builtin_diff,
             prescreen=prescreen,
+            local_probe=local_probe,
         )
 
         if getattr(args, "dry_run", False):
@@ -1914,6 +2109,7 @@ def run_sentinel(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 },
                 "local_exe": local_exe,
                 "pending_updater": pending_updater,
+                "local_probe": local_probe,
                 "models_info": {
                     "found": models_info["found"],
                     "hash": models_info["hash"],
@@ -1951,6 +2147,7 @@ def run_sentinel(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 current_builtin=current_builtin,
                 existing_versions=existing_versions,
                 prompt_text=prompt_text,
+                local_probe=local_probe,
             )
             base_state = state if state is not None else {
                 "last_seen_versions": existing_versions,
@@ -2067,6 +2264,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--acknowledge",
         action="store_true",
         help="Mark pending_notice.json as acknowledged and advance baseline state.",
+    )
+    parser.add_argument(
+        "--lock-updates",
+        action="store_true",
+        help="Purge cached installers, disable auto-update downloads, and lock UI update button.",
+    )
+    parser.add_argument(
+        "--unlock-updates",
+        action="store_true",
+        help="Restore auto-update manifest, setting, and UI update button.",
     )
     parser.add_argument(
         "--audit-latest",

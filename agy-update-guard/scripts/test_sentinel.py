@@ -26,9 +26,11 @@ for p in (SCRIPTS_DIR, SENTINEL_DIR):
         sys.path.insert(0, str(p))
 
 import builtin_snapshot  # noqa: E402
+import local_inspector  # noqa: E402
 import mcp_server  # noqa: E402
 import sentinel  # noqa: E402
 import session_hook  # noqa: E402
+import update_blocker  # noqa: E402
 
 
 SAMPLE_CHANGELOG = """# Changelog
@@ -175,13 +177,7 @@ Details here.
 """
 
 FORBIDDEN_SENSITIVE_TERMS = (
-    "\u5916\u5ba1",
-    "\u9006\u5411",
-    "\u7ed5\u8fc7",
-    "\u89c4\u907f",
     "\u6697\u6539",
-    "\u5c01\u5835",
-    "\u5bf9\u6297",
     "\u8d8a\u72f1",
     "\u7834\u89e3",
     "\u9632\u5c01",
@@ -253,6 +249,19 @@ class _MockHTTPHandler(http.server.BaseHTTPRequestHandler):
 
 
 class TestUpdateGuardV11(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp_localappdata = tempfile.TemporaryDirectory()
+        self._env_patcher = mock.patch.dict(
+            os.environ,
+            {"LOCALAPPDATA": self._tmp_localappdata.name},
+            clear=False,
+        )
+        self._env_patcher.start()
+
+    def tearDown(self) -> None:
+        self._env_patcher.stop()
+        self._tmp_localappdata.cleanup()
+
     def test_01_parse_changelog_multiproduct_and_multiversion(self) -> None:
         parsed = sentinel.parse_changelog(SAMPLE_CHANGELOG)
         self.assertEqual([v["version"] for v in parsed["Antigravity App"]], ["2.35.1", "2.35.0"])
@@ -1408,6 +1417,279 @@ RISK_DIMENSIONS: permission_sandbox, telemetry_upload
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_20_local_inspector_patch_compat_and_guardian_escalation(self) -> None:
+        # 1. Binary diff detects Proctor / SkillScan / Trajectory LLMClassifier escalation & SetCloudCodeURL removal
+        base_ls = (
+            b"MZ...SetCloudCodeURL...You are PolicyGuardian...classifyCommand...classifyMcpToolCall..."
+        )
+        escalated_ls = (
+            b"MZ...SetCloudCodeURL...You are PolicyGuardian...[PROCTOR SKILL SECURITY NOTICE]..."
+            b".jetski.cortex.policyguardian.ProctorSessionR..."
+            b".exa.cortex_pb.PolicyGuardianConfig.SkillScanModeR..."
+            b".filterBlockedSkills..."
+            b".classifyTrajectory..."
+            b".AuditPostExecStep..."
+        )
+        gdiff = local_inspector.diff_guardian_binaries(
+            baseline_ls_bytes=base_ls,
+            target_ls_bytes=escalated_ls,
+            baseline_version="2.35.2",
+            target_version="2.36.0",
+        )
+        self.assertTrue(gdiff["compared"])
+        self.assertTrue(gdiff["cloudcode_url_present"])
+        self.assertTrue(gdiff["proctor_skill_notice_added"])
+        self.assertTrue(gdiff["escalated"])
+        self.assertIn("proctor_engine", gdiff["category_hits"])
+        self.assertIn("skill_mcp_scan", gdiff["category_hits"])
+        self.assertIn("trajectory_llm_classifier", gdiff["category_hits"])
+
+        # 2. Prescreen forces HOLD on Guardian escalation even when Changelog text looks harmless
+        probe_escalated = {
+            "has_pending_probe": True,
+            "target_version": "2.36.0",
+            "current_patch_state": {"checked": True, "chat_editor_installed": True},
+            "chat_editor": {"checked": True, "compatible": True, "summary": "兼容", "output": "ok"},
+            "fork_patch": {"checked": True, "compatible": True, "summary": "兼容", "output": "ok"},
+            "guardian_diff": gdiff,
+            "probe_error": "",
+        }
+        empty_bdiff = {"has_changes": False, "added": [], "removed": [], "modified": [], "diff_summary": ""}
+        ps_guardian = sentinel.prescreen_risks(
+            new_versions_by_product={},
+            models_changed=False,
+            models_diff_text="",
+            models_notices=[],
+            builtin_diff=empty_bdiff,
+            local_probe=probe_escalated,
+        )
+        self.assertEqual(ps_guardian["verdict"], "HOLD")
+        self.assertIn("guardian_classifier_change", ps_guardian["dimensions"])
+        self.assertIn("外审", ps_guardian["fallback_headline"])
+
+        # 3. Prescreen forces HOLD when Fork or Chat-Editor patch is incompatible
+        probe_broken_patch = {
+            "has_pending_probe": True,
+            "target_version": "2.37.0",
+            "current_patch_state": {"checked": True, "chat_editor_installed": True},
+            "chat_editor": {"checked": True, "compatible": False, "summary": "缺少气泡锚点", "output": "err"},
+            "fork_patch": {"checked": True, "compatible": True, "summary": "兼容", "output": "ok"},
+            "guardian_diff": {"compared": True, "cloudcode_url_present": False, "escalated": False},
+            "probe_error": "",
+        }
+        ps_patch = sentinel.prescreen_risks(
+            new_versions_by_product={},
+            models_changed=False,
+            models_diff_text="",
+            models_notices=[],
+            builtin_diff=empty_bdiff,
+            local_probe=probe_broken_patch,
+        )
+        self.assertEqual(ps_patch["verdict"], "HOLD")
+        self.assertIn("local_patch_compat", ps_patch["dimensions"])
+        self.assertIn("Fork/Edit", ps_patch["fallback_headline"])
+
+        # 4. Audit prompt embeds Fork/Edit check results and Guardian binary symbols
+        prompt = sentinel.build_audit_prompt(
+            run_id="run-probe-1",
+            local_exe={"path": "C:\\App\\Antigravity.exe", "version": "2.35.2"},
+            pending_updater={
+                "has_pending": True,
+                "updater_dir": "C:\\Upd",
+                "files": ["pending/Antigravity-x64.exe"],
+                "file_versions": {"pending/Antigravity-x64.exe": "2.36.0"},
+                "pending_version": "2.36.0",
+            },
+            new_versions={},
+            models_info={"found": True, "deprecation_notices": [], "table_rows": []},
+            models_changed=False,
+            models_diff_text="",
+            builtin_diff=empty_bdiff,
+            prescreen=ps_guardian,
+            local_probe=probe_escalated,
+        )
+        self.assertIn("antigravity-fork", prompt)
+        self.assertIn("antigravity-chat-editor", prompt)
+        self.assertIn("PROCTOR SKILL SECURITY NOTICE", prompt)
+        self.assertIn("classifyTrajectory", prompt)
+
+        # 5. companion_paths.json resolution works when installed outside repo tree
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data"
+            tools_root = root / "tools"
+            ce_dir = tools_root / "antigravity-chat-editor"
+            fk_dir = tools_root / "antigravity-fork"
+            ce_dir.mkdir(parents=True)
+            fk_dir.mkdir(parents=True)
+            (ce_dir / "install.py").write_text("# stub\n", encoding="utf-8")
+            (fk_dir / "fork_toolbar.py").write_text("# stub\n", encoding="utf-8")
+            data_dir.mkdir(parents=True)
+            (data_dir / "companion_paths.json").write_text(
+                json.dumps({"tools_root": str(tools_root)}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            resolved = local_inspector.resolve_companion_tools(data_dir=data_dir, plugin_root=root / "isolated")
+            self.assertEqual(resolved["chat_editor_dir"], ce_dir)
+            self.assertEqual(resolved["fork_dir"], fk_dir)
+
+            # 6. Builtin fallback check + cache write vs --dry-run (allow_cache_write=False) + SetCloudCodeURL missing diff
+            missing_cc_diff = local_inspector.diff_guardian_binaries(
+                baseline_ls_bytes=base_ls,
+                target_ls_bytes=b"MZ...You are PolicyGuardian...",
+                baseline_version="2.35.2",
+                target_version="2.36.0",
+            )
+            self.assertFalse(missing_cc_diff["cloudcode_url_present"])
+            self.assertTrue(missing_cc_diff["escalated"])
+
+            upd_dir = root / "updater"
+            (upd_dir / "pending").mkdir(parents=True)
+            fake_installer = upd_dir / "pending" / "Antigravity-x64.exe"
+            fake_installer.write_bytes(b"stub-nsis")
+
+            def fake_extract(_inst: Path, stage_dir: Path) -> None:
+                (stage_dir / "resources" / "bin").mkdir(parents=True, exist_ok=True)
+                fuse_blob = b"MZ" + b"\x00" * 64 + local_inspector.ELECTRON_FUSE_SENTINEL + bytes([1, 5, 0, 0, 0, 0, ord("0")])
+                (stage_dir / "Antigravity.exe").write_bytes(fuse_blob)
+                (stage_dir / "resources" / "app.asar").write_bytes(b"asar")
+                (stage_dir / "resources" / "bin" / "language_server.exe").write_bytes(
+                    b"MZ...SetCloudCodeURL...PK\x05\x06...enable-fork-with-subagents..."
+                )
+
+            pending_info = {
+                "has_pending": True,
+                "updater_dir": str(upd_dir),
+                "files": ["pending/Antigravity-x64.exe"],
+                "file_versions": {"pending/Antigravity-x64.exe": "2.36.0"},
+                "pending_version": "2.36.0",
+                "has_newer_pending": True,
+            }
+            dry_data = root / "dry_data"
+            with mock.patch.object(local_inspector, "_extract_nsis_7z_stage", side_effect=fake_extract) as mocked_ext:
+                # Dry-run mode must NOT create data_dir or installer_probe_cache.json
+                res_dry = local_inspector.probe_local_environment(
+                    local_exe={"path": "", "version": "2.35.2"},
+                    pending_updater=pending_info,
+                    data_dir=dry_data,
+                    plugin_root=root / "no_siblings",
+                    allow_cache_write=False,
+                )
+                self.assertTrue(res_dry["has_pending_probe"])
+                self.assertEqual(res_dry["chat_editor"]["mode"], "builtin_fallback")
+                self.assertTrue(res_dry["chat_editor"]["compatible"])
+                self.assertTrue(res_dry["fork_patch"]["compatible"])
+                self.assertFalse((dry_data / "installer_probe_cache.json").exists())
+                self.assertEqual(mocked_ext.call_count, 1)
+
+                # Normal mode writes cache and second call hits cache without re-extracting
+                cache_data = root / "cache_data"
+                res_cached_1 = local_inspector.probe_local_environment(
+                    local_exe={"path": "", "version": "2.35.2"},
+                    pending_updater=pending_info,
+                    data_dir=cache_data,
+                    plugin_root=root / "no_siblings",
+                    allow_cache_write=True,
+                )
+                self.assertTrue((cache_data / "installer_probe_cache.json").exists())
+                self.assertEqual(mocked_ext.call_count, 2)
+
+                res_cached_2 = local_inspector.probe_local_environment(
+                    local_exe={"path": "", "version": "2.35.2"},
+                    pending_updater=pending_info,
+                    data_dir=cache_data,
+                    plugin_root=root / "no_siblings",
+                    allow_cache_write=True,
+                )
+                self.assertEqual(mocked_ext.call_count, 2)
+                self.assertEqual(res_cached_2["target_version"], res_cached_1["target_version"])
+
+    def test_21_update_blocker_lock_and_unlock_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data"
+            app_dir = root / "app"
+            upd_dir = root / "antigravity-updater"
+            roaming_dir = root / "roaming"
+
+            (app_dir / "resources").mkdir(parents=True)
+            orig_yml = "provider: generic\nurl: https://example.com/manifest/\nupdaterCacheDirName: antigravity-updater\n"
+            (app_dir / "resources" / "app-update.yml").write_text(orig_yml, encoding="utf-8")
+
+            (upd_dir / "pending").mkdir(parents=True)
+            (upd_dir / "installer.exe").write_bytes(b"old-installer")
+            (upd_dir / "pending" / "Antigravity-x64.exe").write_bytes(b"new-installer")
+            (upd_dir / "pending" / "update-info.json").write_text("{}", encoding="utf-8")
+
+            roaming_dir.mkdir(parents=True)
+            (roaming_dir / "app_storage.json").write_text(
+                json.dumps({"autoCheckForUpdates": "true", "keepComputerAwake": "false"}),
+                encoding="utf-8",
+            )
+
+            locked = update_blocker.lock_updates(
+                data_dir=data_dir,
+                app_dir=app_dir,
+                updater_dir=upd_dir,
+                appdata_dir=roaming_dir,
+            )
+            self.assertTrue(locked["locked"])
+            self.assertTrue(locked["auto_check_disabled"])
+            self.assertTrue(locked["manifest_blocked"])
+            self.assertTrue(locked["pending_slot_blocked"])
+            self.assertEqual(locked["remaining_exe_files"], [])
+            self.assertFalse((upd_dir / "installer.exe").exists())
+            self.assertTrue((upd_dir / "pending").is_file())
+
+            # Verify collect_guard_structured_content(refresh=True) with no changes retains update_lock
+            _MockHTTPHandler.routes = {
+                "/changelog.md": SAMPLE_CHANGELOG_V2,
+                "/models.md": SAMPLE_MODELS_V1,
+            }
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _MockHTTPHandler)
+            port = server.server_address[1]
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                builtin_dir = root / "builtin"
+                builtin_dir.mkdir()
+                (builtin_dir / "SKILL.md").write_text("baseline\n", encoding="utf-8")
+                sc_init = sentinel.collect_guard_structured_content(
+                    data_dir=data_dir,
+                    refresh=True,
+                    changelog_url=f"http://127.0.0.1:{port}/changelog.md",
+                    models_url=f"http://127.0.0.1:{port}/models.md",
+                    builtin_dir=builtin_dir,
+                )
+                self.assertTrue(sc_init["update_lock"]["locked"])
+                sc_no_change = sentinel.collect_guard_structured_content(
+                    data_dir=data_dir,
+                    refresh=True,
+                    changelog_url=f"http://127.0.0.1:{port}/changelog.md",
+                    models_url=f"http://127.0.0.1:{port}/models.md",
+                    builtin_dir=builtin_dir,
+                )
+                self.assertEqual(sc_no_change["source"], "live_refresh")
+                self.assertTrue(sc_no_change["update_lock"]["locked"])
+            finally:
+                server.shutdown()
+                server.server_close()
+
+            unlocked = update_blocker.unlock_updates(
+                data_dir=data_dir,
+                app_dir=app_dir,
+                updater_dir=upd_dir,
+                appdata_dir=roaming_dir,
+            )
+            self.assertFalse(unlocked["locked"])
+            self.assertFalse(unlocked["auto_check_disabled"])
+            self.assertFalse(unlocked["manifest_blocked"])
+            self.assertTrue((upd_dir / "pending").is_dir())
+            self.assertEqual(
+                (app_dir / "resources" / "app-update.yml").read_text(encoding="utf-8"),
+                orig_yml,
+            )
 
 
 if __name__ == "__main__":

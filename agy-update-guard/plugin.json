@@ -3,7 +3,7 @@
   "name": "agy-update-guard",
   "displayName": "Update Guard",
   "version": "1.1.0",
-  "description": "零额度定时巡检 Antigravity 官方 Changelog、模型可用性与本机 builtin 内置技能配置快照差异；发现更新或配置变更时在应用内展示提醒横幅与交互状态卡片，支持点击按钮一键新建对话完成版本兼容性与工作区权限评估。",
+  "description": "零额度巡检 Antigravity 更新、待安装安装包 Fork/Edit 补丁兼容性、外审模型与安全护栏（PolicyGuardian/Proctor）二进制差异及 builtin 快照变动；支持应用内提醒与一键新建对话完成升级安全评级。",
   "logo": "assets/logo.svg",
   "license": "MIT",
   "keywords": [
@@ -14,8 +14,8 @@
     "permissions"
   ],
   "suggestedPrompts": [
-    "展示 Update Guard 更新状态卡片，查看近期版本与权限配置变更",
-    "使用 /update-audit 评估最近几个版本的权限预设、沙箱与模型可用性变化",
-    "使用 /update-audit 对比本机 builtin 内置技能与默认配置快照差异"
+    "展示 Update Guard 更新状态卡片，查看待安装版本 Fork/Edit 兼容性与外审变化",
+    "使用 /update-audit 评估新版本对 antigravity-fork、antigravity-chat-editor 及外审强度的影响",
+    "使用 /update-audit 对比本机 builtin 内置技能快照与待安装客户端二进制差异"
   ]
 }
