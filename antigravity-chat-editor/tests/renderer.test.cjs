@@ -158,3 +158,19 @@ test('keeps replies without any stable native identity or still generating unedi
     assert.equal(findResponse(bubble, 3), null);
   } finally { w.dispatchEvent(new w.Event('pagehide')); w.close(); }
 });
+
+test('disables and intercepts top update-nudge button clicks when updateLocked is active', async () => {
+  const dom = new JSDOM('<button class="update-nudge update-nudge-pill"><span>Update Available</span></button>',
+    { pretendToBeVisual: true, runScripts: 'outside-only' });
+  const w = dom.window;
+  let lockedState = true, nudgeClicked = false;
+  const nudge = w.document.querySelector('.update-nudge');
+  nudge.addEventListener('click', () => { nudgeClicked = true; });
+  w.agyChatEditor = { invoke: async () => ({ rules: [], updateLocked: lockedState }) };
+  try {
+    w.eval(script); await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(w.document.documentElement.dataset.agyUpdateLocked, '1');
+    nudge.querySelector('span').click();
+    assert.equal(nudgeClicked, false);
+  } finally { w.dispatchEvent(new w.Event('pagehide')); w.close(); }
+});

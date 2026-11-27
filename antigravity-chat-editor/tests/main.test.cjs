@@ -31,8 +31,12 @@ test('accepts a live /c/id chat, persists an edit, and never quits the app', asy
   } };
   const electron = { app: application, ipcMain: { removeHandler: key => handlers.delete(key), handle: (key, handler) => handlers.set(key, handler) },
     webContents: { getAllWebContents: () => [] }, webFrameMain: {} };
+  const lockFile = path.join(directory, 'update_lock.json');
+  fs.writeFileSync(lockFile, JSON.stringify({ locked: true }));
+  const prevLockEnv = process.env.AGY_UPDATE_GUARD_LOCK_FILE;
+  process.env.AGY_UPDATE_GUARD_LOCK_FILE = lockFile;
   const module = { exports: {} };
-  const context = vm.createContext({ module, exports: module.exports, __dirname: directory, console, Buffer, URL,
+  const context = vm.createContext({ module, exports: module.exports, __dirname: directory, process, console, Buffer, URL,
     require: name => name === 'electron' ? electron : name === 'node:https' ? fakeHTTPS : name === './proxy.cjs' ? {
       createProxy: () => ({ once() {}, listen(_port, _host, callback) { callback(); }, address: () => ({ port: 23456 }), close() {} }),
     } : name.startsWith('./') ? require(path.join(__dirname, '..', name)) : require(name) });
@@ -47,6 +51,11 @@ test('accepts a live /c/id chat, persists an edit, and never quits the app', asy
     const result = await handler(event, { action: 'save', request: { index: 0, cascadeId: ID, viewCascadeId: ID,
       messageId: 'bot-a', original: 'original', text: 'edited' } });
     assert.equal(result.rules[0].text, 'edited'); assert.equal(quit, false);
+    const listed = await handler(event, { action: 'list' });
+    assert.equal(listed.updateLocked, true);
+    fs.writeFileSync(lockFile, JSON.stringify({ locked: false }));
+    const listedUnlocked = await handler(event, { action: 'list' });
+    assert.equal(listedUnlocked.updateLocked, false);
     assert.equal(JSON.parse(fs.readFileSync(path.join(directory, '.local/edits.json')))[0].cascadeId, ID);
     assert.ok(calls.some(call => call.method === 'SetCloudCodeURL'));
     const bad = { senderFrame: { url: 'https://evil.example/c/' + ID }, sender: { mainFrame: frame } };
@@ -68,5 +77,10 @@ test('accepts a live /c/id chat, persists an edit, and never quits the app', asy
     const { rewriteRequest } = require('../proxy.cjs');
     assert.throws(() => rewriteRequest({ requestId: 'agent/' + ID + '/turn', request: { labels: { cascade_id: ID },
       contents: [{ role: 'model', parts: [{ text: 'original' }] }, { role: 'model', parts: [{ text: 'original' }] }] } }, [refreshed]), /重复回复/);
-  } finally { if (runtime) await runtime.dispose(); fs.rmSync(directory, { recursive: true, force: true }); }
+  } finally {
+    if (prevLockEnv === undefined) delete process.env.AGY_UPDATE_GUARD_LOCK_FILE;
+    else process.env.AGY_UPDATE_GUARD_LOCK_FILE = prevLockEnv;
+    if (runtime) await runtime.dispose();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });

@@ -1,6 +1,7 @@
 'use strict';
 const { app, ipcMain, webContents, webFrameMain } = require('electron');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const https = require('node:https');
 const { createProxy } = require('./proxy.cjs');
@@ -10,6 +11,11 @@ const LOCAL = path.join(__dirname, '.local');
 const EDITS = path.join(LOCAL, 'edits.json');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CHANNEL = 'agy-chat-editor:invoke';
+function isUpdateLocked() {
+  const lockFile = process.env.AGY_UPDATE_GUARD_LOCK_FILE ||
+    path.join(os.homedir(), '.gemini', 'antigravity', 'plugin_data', 'agy-update-guard', 'update_lock.json');
+  try { return fs.existsSync(lockFile) && JSON.parse(fs.readFileSync(lockFile, 'utf8'))?.locked === true; } catch { return false; }
+}
 function atomicJSON(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = file + '.tmp'; fs.writeFileSync(temporary, JSON.stringify(value, null, 2), { mode: 0o600 }); fs.renameSync(temporary, file);
@@ -112,8 +118,8 @@ function start(languageServer) {
   ipcMain.handle(CHANNEL, async (event, data) => {
     if (!trusted(event.senderFrame) || !trusted(event.sender.mainFrame)) throw new Error('禁止在非 Antigravity 页面调用');
     if (data?.action === 'save') return save(data.request);
-    if (data?.action === 'list') { await activate(); return { ok: true, rules, last }; }
-    if (data?.action === 'status') return { ok: true, state: 'live', last, active: !!relay && activatedPid === languageServer.getLsProcess()?.pid };
+    if (data?.action === 'list') { await activate(); return { ok: true, rules, last, updateLocked: isUpdateLocked() }; }
+    if (data?.action === 'status') return { ok: true, state: 'live', last, updateLocked: isUpdateLocked(), active: !!relay && activatedPid === languageServer.getLsProcess()?.pid };
     throw new Error('未知编辑器操作');
   });
   const script = () => fs.readFileSync(path.join(__dirname, 'renderer.js'), 'utf8');
