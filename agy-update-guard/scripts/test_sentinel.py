@@ -1214,6 +1214,201 @@ RISK_DIMENSIONS: permission_sandbox, telemetry_upload
         self.assertIn("App v2.36.0 (本地待安装)", label)
         self.assertIn("CLI v1.5.17", label)
 
+    def test_19_stale_acknowledged_notice_does_not_shadow_newer_state_and_init_baseline_clears_it(self) -> None:
+        _MockHTTPHandler.routes = {
+            "/changelog.md": SAMPLE_CHANGELOG_V2,
+            "/models.md": SAMPLE_MODELS_V1,
+        }
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _MockHTTPHandler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                data_dir = Path(tmp) / "data"
+                builtin_dir = Path(tmp) / "builtin"
+                builtin_dir.mkdir()
+                (builtin_dir / "SKILL.md").write_text("baseline\n", encoding="utf-8")
+
+                # state.json is already at App 2.36.0 while an old acknowledged 2.35.2 notice remains on disk
+                sentinel.save_state(
+                    data_dir / "state.json",
+                    {
+                        "last_seen_versions": {
+                            "Antigravity App": "2.36.0",
+                            "Antigravity CLI": "1.5.16",
+                            "Antigravity IDE": "2.8.0",
+                        },
+                        "models_section_hash": "hash-1",
+                        "models_section_text": SAMPLE_MODELS_V1,
+                        "local_exe_version": "2.35.2",
+                        "last_seen_pending_version": "2.36.0",
+                        "last_checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    },
+                )
+                (data_dir / "pending_notice.json").write_text(
+                    json.dumps(
+                        {
+                            "notice_id": "old-2352",
+                            "acknowledged": True,
+                            "version_label": "App v2.35.2",
+                            "verdict": "SAFE",
+                            "headline": "旧通知",
+                            "latest_versions": {
+                                "Antigravity App": "2.35.2",
+                                "Antigravity CLI": "1.5.16",
+                                "Antigravity IDE": "2.8.0",
+                            },
+                            "review_prompt": "old",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+
+                live_exe = {"path": "C:\\Live\\Antigravity.exe", "version": "2.35.2"}
+                no_pending = {
+                    "has_pending": False,
+                    "updater_dir": "",
+                    "files": [],
+                    "file_versions": {},
+                    "pending_version": "",
+                    "has_newer_pending": False,
+                }
+                with (
+                    mock.patch.object(sentinel, "get_local_antigravity_version", return_value=live_exe),
+                    mock.patch.object(sentinel, "check_pending_updater_files", return_value=no_pending),
+                ):
+                    sc = sentinel.collect_guard_structured_content(
+                        data_dir=data_dir,
+                        refresh=False,
+                        builtin_dir=builtin_dir,
+                    )
+                    self.assertEqual(sc["source"], "cached_state")
+                    self.assertEqual(sc["version_label"], "App v2.36.0")
+                    self.assertEqual(sc["latest_versions"]["Antigravity App"], "2.36.0")
+
+                    # Unread notice must never be treated as stale/skipped
+                    unread_notice = {
+                        "notice_id": "unread-2352",
+                        "acknowledged": False,
+                        "version_label": "App v2.35.2",
+                        "verdict": "HOLD",
+                        "headline": "未读通知",
+                        "latest_versions": {"Antigravity App": "2.35.2"},
+                        "review_prompt": "unread",
+                    }
+                    (data_dir / "pending_notice.json").write_text(
+                        json.dumps(unread_notice, ensure_ascii=False), encoding="utf-8"
+                    )
+                    sc_unread = sentinel.collect_guard_structured_content(
+                        data_dir=data_dir,
+                        refresh=False,
+                        builtin_dir=builtin_dir,
+                    )
+                    self.assertEqual(sc_unread["source"], "pending_notice")
+                    self.assertTrue(sc_unread["has_unread_notice"])
+
+                    # Newer acknowledged notice with empty pending_version but App >= last_seen_pending_version is NOT stale
+                    fresh_ack_notice = {
+                        "notice_id": "fresh-2360",
+                        "acknowledged": True,
+                        "version_label": "App v2.36.0",
+                        "verdict": "SAFE",
+                        "headline": "已确认新版本",
+                        "latest_versions": {
+                            "Antigravity App": "2.36.0",
+                            "Antigravity CLI": "1.5.16",
+                            "Antigravity IDE": "2.8.0",
+                        },
+                        "pending_updater": {"has_pending": False, "pending_version": "", "files": []},
+                        "review_prompt": "fresh",
+                    }
+                    (data_dir / "pending_notice.json").write_text(
+                        json.dumps(fresh_ack_notice, ensure_ascii=False), encoding="utf-8"
+                    )
+                    sc_fresh = sentinel.collect_guard_structured_content(
+                        data_dir=data_dir,
+                        refresh=False,
+                        builtin_dir=builtin_dir,
+                    )
+                    self.assertEqual(sc_fresh["source"], "pending_notice")
+                    self.assertEqual(sc_fresh["notice_id"], "fresh-2360")
+
+                    # refresh=True with no upstream changes cleans up stale acknowledged notice + builtin_pending.json
+                    stale_ack_notice = {
+                        "notice_id": "old-2352",
+                        "acknowledged": True,
+                        "version_label": "App v2.35.2",
+                        "verdict": "SAFE",
+                        "headline": "旧通知",
+                        "latest_versions": {
+                            "Antigravity App": "2.35.2",
+                            "Antigravity CLI": "1.5.16",
+                            "Antigravity IDE": "2.8.0",
+                        },
+                        "review_prompt": "old",
+                    }
+                    pending_snap = data_dir / "snapshots" / "builtin_pending.json"
+                    pending_snap.parent.mkdir(parents=True, exist_ok=True)
+                    pending_snap.write_text("{}", encoding="utf-8")
+                    (data_dir / "pending_notice.json").write_text(
+                        json.dumps(stale_ack_notice, ensure_ascii=False), encoding="utf-8"
+                    )
+                    sentinel.save_state(
+                        data_dir / "state.json",
+                        {
+                            "last_seen_versions": {
+                                "Antigravity App": "2.36.0",
+                                "Antigravity CLI": "1.5.16",
+                                "Antigravity IDE": "2.8.0",
+                            },
+                            "models_section_hash": sentinel.extract_reasoning_models_section(SAMPLE_MODELS_V1)["hash"],
+                            "models_section_text": sentinel.extract_reasoning_models_section(SAMPLE_MODELS_V1)["text"],
+                            "local_exe_version": "2.35.2",
+                            "last_seen_pending_version": "2.36.0",
+                            "last_checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        },
+                    )
+                    sc_refreshed = sentinel.collect_guard_structured_content(
+                        data_dir=data_dir,
+                        refresh=True,
+                        changelog_url=f"http://127.0.0.1:{port}/changelog.md",
+                        models_url=f"http://127.0.0.1:{port}/models.md",
+                        builtin_dir=builtin_dir,
+                    )
+                    self.assertEqual(sc_refreshed["source"], "live_refresh")
+                    self.assertFalse((data_dir / "pending_notice.json").exists())
+                    self.assertFalse(pending_snap.exists())
+
+                    # --init-baseline clears both pending_notice.json and snapshots/builtin_pending.json
+                    (data_dir / "pending_notice.json").write_text(
+                        json.dumps(stale_ack_notice, ensure_ascii=False), encoding="utf-8"
+                    )
+                    pending_snap.write_text("{}", encoding="utf-8")
+                    code, _ = sentinel.run_sentinel(
+                        argparse.Namespace(
+                            check=False,
+                            init_baseline=True,
+                            acknowledge=False,
+                            audit_latest=False,
+                            dry_run=False,
+                            manual_create_conversation=False,
+                            data_dir=str(data_dir),
+                            builtin_dir=str(builtin_dir),
+                            changelog_url=f"http://127.0.0.1:{port}/changelog.md",
+                            models_url=f"http://127.0.0.1:{port}/models.md",
+                            model=None,
+                            wait_seconds=5,
+                        )
+                    )
+                    self.assertEqual(code, 0)
+                    self.assertFalse((data_dir / "pending_notice.json").exists())
+                    self.assertFalse(pending_snap.exists())
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

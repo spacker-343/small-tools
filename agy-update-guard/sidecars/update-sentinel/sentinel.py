@@ -376,6 +376,47 @@ def check_pending_updater_files(
     }
 
 
+def _is_notice_stale_against_state(
+    notice: dict[str, Any] | None,
+    state: dict[str, Any] | None,
+) -> bool:
+    """Return True if an already-acknowledged notice is older than state.json."""
+    if not notice or notice.get("acknowledged") is not True or not state:
+        return False
+    state_versions = state.get("last_seen_versions") or {}
+    notice_versions = notice.get("latest_versions") or {}
+    for product in PRODUCT_LINES:
+        s_ver = str(state_versions.get(product) or "").strip()
+        if not s_ver:
+            continue
+        n_ver = str(notice_versions.get(product) or "").strip()
+        if not n_ver or parse_version_tuple(s_ver) > parse_version_tuple(n_ver):
+            return True
+    s_pending = str(state.get("last_seen_pending_version") or "").strip()
+    if s_pending:
+        n_pending = str((notice.get("pending_updater") or {}).get("pending_version") or "").strip()
+        n_app = str(notice_versions.get("Antigravity App") or "").strip()
+        candidates = [v for v in (n_pending, n_app) if v]
+        if not candidates or parse_version_tuple(s_pending) > max(
+            parse_version_tuple(v) for v in candidates
+        ):
+            return True
+    return False
+
+
+def _clear_pending_notice_files(data_dir: Path) -> None:
+    """Remove stale pending_notice.json and snapshots/builtin_pending.json if present."""
+    for target in (
+        data_dir / "pending_notice.json",
+        data_dir / "snapshots" / "builtin_pending.json",
+    ):
+        if target.exists():
+            try:
+                target.unlink()
+            except OSError:
+                pass
+
+
 def _is_pending_installer_unseen(
     pending_updater: dict[str, Any],
     state: dict[str, Any] | None,
@@ -1529,6 +1570,9 @@ def collect_guard_structured_content(
                 }
 
             unread_existing = bool(notice and not notice.get("acknowledged", False))
+            if not unread_existing and _is_notice_stale_against_state(notice, state):
+                _clear_pending_notice_files(resolved_data)
+                notice = None
             return {
                 "has_unread_notice": unread_existing,
                 "acknowledged": not unread_existing,
@@ -1566,7 +1610,7 @@ def collect_guard_structured_content(
         except Exception as exc:
             refresh_error = str(exc)
 
-    if notice is not None:
+    if notice is not None and not _is_notice_stale_against_state(notice, state):
         acknowledged = bool(notice.get("acknowledged", False))
         dims = list(notice.get("dimensions") or [])
         effective_local_exe = (
@@ -1743,6 +1787,7 @@ def run_sentinel(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             if not getattr(args, "dry_run", False):
                 save_state(state_path, new_state)
                 builtin_snapshot.save_snapshot(current_builtin, baseline_path)
+                _clear_pending_notice_files(data_dir)
             result = {
                 "mode": "init_baseline",
                 "status": "initialized",
