@@ -14,9 +14,18 @@ from pathlib import Path
 from typing import Any
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-SENTINEL_SCRIPT = PLUGIN_ROOT / "sidecars" / "update-sentinel" / "sentinel.py"
+SENTINEL_DIR = PLUGIN_ROOT / "sidecars" / "update-sentinel"
+SENTINEL_SCRIPT = SENTINEL_DIR / "sentinel.py"
 CHECK_INTERVAL_SECONDS = 4 * 3600
 LOCK_TTL_SECONDS = 5 * 60
+
+if str(SENTINEL_DIR) not in sys.path:
+    sys.path.insert(0, str(SENTINEL_DIR))
+
+try:
+    import sentinel as _sentinel  # type: ignore[import-not-found]
+except Exception:
+    _sentinel = None
 
 
 def resolve_data_dir(cli_data_dir: str | None = None) -> Path:
@@ -73,16 +82,81 @@ def _is_lock_active(lock_path: Path, now_ts: float | None = None) -> bool:
         return False
 
 
+def _parse_version_tuple(version: str) -> tuple[int, ...]:
+    if _sentinel is not None:
+        return _sentinel.parse_version_tuple(version)
+    parts = [int(p) for p in str(version or "").lstrip("vV").split(".") if p.isdigit()]
+    return tuple(parts) if parts else (0,)
+
+
+def _detect_unnotified_pending_installer(
+    data_dir: Path,
+    notice: dict[str, Any] | None = None,
+    local_exe: dict[str, str] | None = None,
+    pending_updater: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Detect a locally downloaded pending installer newer than current exe and not yet covered."""
+    resolved_local = local_exe
+    if resolved_local is None:
+        if _sentinel is None:
+            return None
+        resolved_local = _sentinel.get_local_antigravity_version()
+    local_ver = str((resolved_local or {}).get("version") or "").strip()
+
+    resolved_pending = pending_updater
+    if resolved_pending is None:
+        if _sentinel is None:
+            return None
+        resolved_pending = _sentinel.check_pending_updater_files(local_version=local_ver)
+
+    if not resolved_pending or not resolved_pending.get("has_newer_pending"):
+        return None
+
+    pending_ver = str(resolved_pending.get("pending_version") or "").strip()
+    if not pending_ver:
+        return None
+    pending_tuple = _parse_version_tuple(pending_ver)
+
+    # If an unread pending_notice already covers this pending version, let the formal notice render.
+    if notice and notice.get("acknowledged") is not True:
+        notice_app_ver = str(
+            (notice.get("latest_versions") or {}).get("Antigravity App") or ""
+        ).strip()
+        notice_pending_ver = str(
+            (notice.get("pending_updater") or {}).get("pending_version") or ""
+        ).strip()
+        if (notice_app_ver and _parse_version_tuple(notice_app_ver) >= pending_tuple) or (
+            notice_pending_ver and _parse_version_tuple(notice_pending_ver) >= pending_tuple
+        ):
+            return None
+
+    # If the user already acknowledged this version in state.json, do not re-alert.
+    state = _read_json_safe(data_dir / "state.json") or {}
+    seen_pending = str(state.get("last_seen_pending_version") or "").strip()
+    seen_app = str((state.get("last_seen_versions") or {}).get("Antigravity App") or "").strip()
+    if seen_pending and _parse_version_tuple(seen_pending) >= pending_tuple:
+        return None
+    if seen_app and _parse_version_tuple(seen_app) >= pending_tuple:
+        return None
+
+    return {
+        "local_version": local_ver or "unknown",
+        "pending_version": pending_ver,
+        "pending_updater": resolved_pending,
+    }
+
+
 def maybe_spawn_background_check(
     data_dir: Path,
     now_ts: float | None = None,
     popen_fn: Any = None,
+    force: bool = False,
 ) -> bool:
-    """Spawn detached `sentinel.py --check` if >4h since last check and no active lock."""
+    """Spawn detached `sentinel.py --check` if >4h since last check (or forced) and no active lock."""
     launcher = popen_fn or subprocess.Popen
     if not SENTINEL_SCRIPT.is_file():
         return False
-    if not _is_check_due(data_dir, now_ts=now_ts):
+    if not force and not _is_check_due(data_dir, now_ts=now_ts):
         return False
 
     lock_path = data_dir / "check.lock"
@@ -123,6 +197,31 @@ def maybe_spawn_background_check(
         return False
 
 
+def _format_pending_files(pending_updater: dict[str, Any]) -> str:
+    file_versions = pending_updater.get("file_versions") or {}
+    parts: list[str] = []
+    for f in pending_updater.get("files") or []:
+        f_str = str(f)
+        ver = str(file_versions.get(f_str) or "").strip()
+        parts.append(f"{f_str} (v{ver})" if ver else f_str)
+    return ", ".join(parts)
+
+
+def build_pending_installer_markdown(info: dict[str, Any]) -> str:
+    """Format an immediate in-app alert when a newer local pending installer is detected."""
+    local_ver = str(info.get("local_version") or "unknown")
+    pending_ver = str(info.get("pending_version") or "新版本")
+    pending_updater = info.get("pending_updater") or {}
+    files = _format_pending_files(pending_updater)
+    return (
+        f"> [!WARNING]\n"
+        f"> **Update Guard 检测到本地已下载新版本安装包：App v{pending_ver}**（当前本机：`v{local_ver}`）\n"
+        f"> - **待安装更新包**：`{files}`。后台已自动触发最新 Changelog 与权限变更检测，**请先完成兼容性审查再决定是否重启更新**。\n"
+        f"> - [🛡️ 打开 Update Guard 插件页（点击刷新并新建审查对话）](customization://agy-update-guard)\n"
+        f"> - 也可在右上角 **Overview → Plugins → `Update Guard`** 侧边栏卡片中点击 **「🔄 刷新检测（0 额度）」** 后再点击 **「🚀 新建对话审查本次更新」**。"
+    )
+
+
 def build_notice_markdown(notice: dict[str, Any]) -> str:
     """Format an unread pending_notice.json payload as a concise GitHub Alert Markdown."""
     verdict = str(notice.get("verdict") or "CAUTION").upper()
@@ -135,7 +234,7 @@ def build_notice_markdown(notice: dict[str, Any]) -> str:
     pending_updater = notice.get("pending_updater") or {}
     pending_line = ""
     if pending_updater.get("has_pending"):
-        files = ", ".join(str(f) for f in (pending_updater.get("files") or []))
+        files = _format_pending_files(pending_updater)
         pending_line = (
             f"\n> - **待安装更新包**：检测到本地 `antigravity-updater` 缓存 (`{files}`)，建议先完成兼容性审查再决定是否重启更新。"
         )
@@ -153,16 +252,28 @@ def build_notice_markdown(notice: dict[str, Any]) -> str:
 def build_hook_output(
     data_dir: Path,
     spawn_check: bool = True,
+    local_exe: dict[str, str] | None = None,
+    pending_updater: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute SessionStart logic and return the JSON payload for Antigravity."""
-    if spawn_check:
-        maybe_spawn_background_check(data_dir)
-
     notice = _read_json_safe(data_dir / "pending_notice.json")
-    if not notice or notice.get("acknowledged") is True:
+    unnotified_pending = _detect_unnotified_pending_installer(
+        data_dir,
+        notice=notice,
+        local_exe=local_exe,
+        pending_updater=pending_updater,
+    )
+
+    if spawn_check:
+        maybe_spawn_background_check(data_dir, force=bool(unnotified_pending))
+
+    if unnotified_pending is not None:
+        user_markdown = build_pending_installer_markdown(unnotified_pending)
+    elif notice and notice.get("acknowledged") is not True:
+        user_markdown = build_notice_markdown(notice)
+    else:
         return {}
 
-    user_markdown = build_notice_markdown(notice)
     return {
         "injectSteps": [
             {

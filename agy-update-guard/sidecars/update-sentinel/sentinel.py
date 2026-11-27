@@ -314,27 +314,140 @@ def get_local_antigravity_version() -> dict[str, str]:
     return {"path": "", "version": "unknown"}
 
 
-def check_pending_updater_files(updater_dir: Path | None = None) -> dict[str, Any]:
+def check_pending_updater_files(
+    updater_dir: Path | None = None,
+    local_version: str | None = None,
+) -> dict[str, Any]:
     """Check %LOCALAPPDATA%\\antigravity-updater recursively for pending .exe installers."""
     if updater_dir is None:
         local_app_data = os.environ.get("LOCALAPPDATA", "")
         if not local_app_data:
-            return {"has_pending": False, "updater_dir": "", "files": []}
+            return {
+                "has_pending": False,
+                "updater_dir": "",
+                "files": [],
+                "file_versions": {},
+                "pending_version": "",
+                "has_newer_pending": False,
+            }
         updater_dir = Path(local_app_data) / "antigravity-updater"
 
     if not updater_dir.exists() or not updater_dir.is_dir():
-        return {"has_pending": False, "updater_dir": str(updater_dir), "files": []}
+        return {
+            "has_pending": False,
+            "updater_dir": str(updater_dir),
+            "files": [],
+            "file_versions": {},
+            "pending_version": "",
+            "has_newer_pending": False,
+        }
 
-    exe_files = sorted(
-        p.relative_to(updater_dir).as_posix()
-        for p in updater_dir.rglob("*.exe")
-        if p.is_file()
+    exe_paths = sorted(
+        (p for p in updater_dir.rglob("*.exe") if p.is_file()),
+        key=lambda p: p.relative_to(updater_dir).as_posix(),
+    )
+    exe_files: list[str] = []
+    file_versions: dict[str, str] = {}
+    pending_candidates: list[tuple[tuple[int, ...], str]] = []
+
+    for exe_path in exe_paths:
+        rel = exe_path.relative_to(updater_dir).as_posix()
+        exe_files.append(rel)
+        ver = _read_pe_version_ctypes(exe_path)
+        if ver and ver != "unknown":
+            file_versions[rel] = ver
+            if rel.lower().startswith("pending/"):
+                pending_candidates.append((parse_version_tuple(ver), ver))
+
+    pending_version = max(pending_candidates, key=lambda x: x[0])[1] if pending_candidates else ""
+    has_newer_pending = bool(
+        pending_version
+        and local_version
+        and local_version != "unknown"
+        and parse_version_tuple(pending_version) > parse_version_tuple(local_version)
     )
     return {
         "has_pending": bool(exe_files),
         "updater_dir": str(updater_dir),
         "files": exe_files,
+        "file_versions": file_versions,
+        "pending_version": pending_version,
+        "has_newer_pending": has_newer_pending,
     }
+
+
+def _is_pending_installer_unseen(
+    pending_updater: dict[str, Any],
+    state: dict[str, Any] | None,
+) -> bool:
+    """Return True if a newer local pending installer has not yet been acknowledged in state."""
+    if not pending_updater.get("has_newer_pending"):
+        return False
+    pending_ver = str(pending_updater.get("pending_version") or "").strip()
+    if not pending_ver:
+        return False
+    pending_tuple = parse_version_tuple(pending_ver)
+    state_obj = state or {}
+    last_seen_pending = str(state_obj.get("last_seen_pending_version") or "").strip()
+    if last_seen_pending and parse_version_tuple(last_seen_pending) >= pending_tuple:
+        return False
+    last_seen_app = str(
+        (state_obj.get("last_seen_versions") or {}).get("Antigravity App") or ""
+    ).strip()
+    if last_seen_app and parse_version_tuple(last_seen_app) >= pending_tuple:
+        return False
+    return True
+
+
+def _format_pending_files_display(pending_updater: dict[str, Any]) -> str:
+    """Format updater .exe file list with PE versions when available."""
+    file_versions = pending_updater.get("file_versions") or {}
+    formatted: list[str] = []
+    for rel in pending_updater.get("files") or []:
+        rel_str = str(rel)
+        ver = str(file_versions.get(rel_str) or "").strip()
+        formatted.append(f"{rel_str} (v{ver})" if ver else rel_str)
+    return ", ".join(formatted)
+
+
+def _build_local_env_lines(
+    local_exe: dict[str, str],
+    pending_updater: dict[str, Any],
+) -> list[str]:
+    """Build the '## 本机客户端环境' body lines for audit prompts."""
+    lines = [
+        f"- 本机 Antigravity.exe 版本: `{local_exe.get('version', 'unknown')}` (`{local_exe.get('path') or '未检测到路径'}`)",
+    ]
+    if pending_updater.get("has_pending"):
+        files_str = _format_pending_files_display(pending_updater)
+        pending_ver = str(pending_updater.get("pending_version") or "").strip()
+        ver_note = f"（待安装版本：`v{pending_ver}`）" if pending_ver else ""
+        lines.append(
+            f"- ⚠️ **本地更新缓存提示**：检测到 `{pending_updater.get('updater_dir')}` 存在已下载待安装文件 (`{files_str}`){ver_note}。若评估建议暂缓升级，**请勿点击“重启更新”或直接重启客户端**。"
+        )
+    else:
+        lines.append("- 本地更新缓存 (`antigravity-updater`): 未检测到待安装 `.exe` 文件。")
+    return lines
+
+
+def _refresh_prompt_local_env(
+    prompt_text: str,
+    local_exe: dict[str, str],
+    pending_updater: dict[str, Any],
+) -> str:
+    """Refresh the '## 本机客户端环境' section inside a cached review prompt."""
+    if not prompt_text or "## 本机客户端环境" not in prompt_text:
+        return prompt_text
+    replacement = "## 本机客户端环境\n" + "\n".join(
+        _build_local_env_lines(local_exe, pending_updater)
+    )
+    return re.sub(
+        r"## 本机客户端环境\r?\n.*?(?=\r?\n\r?\n## |\Z)",
+        lambda _m: replacement,
+        prompt_text,
+        count=1,
+        flags=re.DOTALL,
+    )
 
 
 def resolve_data_dir(cli_data_dir: str | Path | None = None) -> Path:
@@ -495,6 +608,7 @@ def _build_version_label(
     parsed_changelog: dict[str, list[dict[str, Any]]],
     models_changed: bool,
     builtin_changed: bool,
+    pending_installer_version: str = "",
 ) -> str:
     """Create a concise version label for UI headers and reports."""
     parts: list[str] = []
@@ -503,6 +617,8 @@ def _build_version_label(
         if items:
             short = product.replace("Antigravity ", "")
             parts.append(f"{short} {items[0]['tag']}")
+    if not (new_versions.get("Antigravity App") or []) and pending_installer_version:
+        parts.insert(0, f"App v{pending_installer_version} (本地待安装)")
     if not parts:
         app_entries = parsed_changelog.get("Antigravity App") or []
         if app_entries:
@@ -532,16 +648,8 @@ def build_audit_prompt(
         "你是 Antigravity 版本更新与工作区权限兼容性评估助手。**请仅基于下方提供的采集材料直接分析输出，不要调用任何联网、终端、读文件或子代理工具。**",
         "",
         "## 本机客户端环境",
-        f"- 本机 Antigravity.exe 版本: `{local_exe.get('version', 'unknown')}` (`{local_exe.get('path') or '未检测到路径'}`)",
+        *_build_local_env_lines(local_exe, pending_updater),
     ]
-
-    if pending_updater.get("has_pending"):
-        files_str = ", ".join(pending_updater.get("files", []))
-        lines.append(
-            f"- ⚠️ **本地更新缓存提示**：检测到 `{pending_updater.get('updater_dir')}` 存在已下载待安装文件 (`{files_str}`)。若评估建议暂缓升级，**请勿点击“重启更新”或直接重启客户端**。"
-        )
-    else:
-        lines.append("- 本地更新缓存 (`antigravity-updater`): 未检测到待安装 `.exe` 文件。")
 
     lines.extend(
         [
@@ -1107,10 +1215,21 @@ def acknowledge_pending_notice(
         or state.get("models_section_text", "")
     )
     local_exe = notice.get("local_exe") or {}
+    live_exe = get_local_antigravity_version()
+    live_ver = str(live_exe.get("version") or "").strip()
     new_local_ver = (
-        pending_baseline.get("local_exe_version")
+        (live_ver if live_ver and live_ver != "unknown" else "")
+        or pending_baseline.get("local_exe_version")
         or local_exe.get("version")
         or state.get("local_exe_version", "unknown")
+    )
+    if live_ver and live_ver != "unknown":
+        notice["local_exe"] = live_exe
+
+    pending_updater_ver = (
+        str(pending_baseline.get("pending_updater_version") or "").strip()
+        or str((notice.get("pending_updater") or {}).get("pending_version") or "").strip()
+        or str(state.get("last_seen_pending_version") or "").strip()
     )
 
     new_state = {
@@ -1119,6 +1238,7 @@ def acknowledge_pending_notice(
         "models_section_hash": new_models_hash,
         "models_section_text": new_models_text,
         "local_exe_version": new_local_ver,
+        "last_seen_pending_version": pending_updater_ver,
         "last_checked_at": state.get("last_checked_at") or now_iso,
         "updated_at": now_iso,
         "audit_history": state.get("audit_history", []),
@@ -1213,6 +1333,7 @@ def _write_pending_notice_bundle(
             "models_section_hash": models_info["hash"],
             "models_section_text": models_info["text"],
             "local_exe_version": local_exe["version"],
+            "pending_updater_version": str(pending_updater.get("pending_version") or ""),
         },
     }
     _write_json_atomic(data_dir / "pending_notice.json", notice)
@@ -1252,7 +1373,7 @@ def collect_guard_structured_content(
     state = load_state(state_path)
     notice = load_pending_notice(resolved_data)
     local_exe = get_local_antigravity_version()
-    pending_updater = check_pending_updater_files()
+    pending_updater = check_pending_updater_files(local_version=local_exe["version"])
 
     should_refresh = refresh or (state is None and notice is None)
     refresh_error = ""
@@ -1319,8 +1440,13 @@ def collect_guard_structured_content(
                     "current_file_count": current_builtin["file_count"],
                 }
 
+            pending_ver = str(pending_updater.get("pending_version") or "")
+            pending_installer_changed = _is_pending_installer_unseen(pending_updater, state)
             has_any_change = bool(
-                delta_versions or models_changed or builtin_diff.get("has_changes")
+                delta_versions
+                or models_changed
+                or builtin_diff.get("has_changes")
+                or pending_installer_changed
             )
             display_versions = (
                 delta_versions
@@ -1334,12 +1460,20 @@ def collect_guard_structured_content(
                 models_info.get("deprecation_notices", []),
                 builtin_diff,
             )
+            if (
+                pending_installer_changed
+                and not (delta_versions.get("Antigravity App") or [])
+                and prescreen["verdict"] == "SAFE"
+            ):
+                prescreen["verdict"] = "CAUTION"
+                prescreen["fallback_headline"] = f"本地已下载待安装更新包 v{pending_ver}"[:36]
             run_id = str(uuid.uuid4())
             version_label = _build_version_label(
                 display_versions,
                 parsed_changelog,
                 models_changed,
                 bool(builtin_diff.get("has_changes")),
+                pending_installer_version=pending_ver if pending_installer_changed else "",
             )
             prompt_text = build_audit_prompt(
                 run_id=run_id,
@@ -1435,6 +1569,16 @@ def collect_guard_structured_content(
     if notice is not None:
         acknowledged = bool(notice.get("acknowledged", False))
         dims = list(notice.get("dimensions") or [])
+        effective_local_exe = (
+            local_exe
+            if local_exe.get("version") != "unknown"
+            else (notice.get("local_exe") or local_exe)
+        )
+        refreshed_prompt = _refresh_prompt_local_env(
+            str(notice.get("review_prompt", "")),
+            effective_local_exe,
+            pending_updater,
+        )
         return {
             "has_unread_notice": not acknowledged,
             "acknowledged": acknowledged,
@@ -1449,13 +1593,13 @@ def collect_guard_structured_content(
             "dimension_labels": list(
                 notice.get("dimension_labels") or [DIM_LABELS_ZH.get(d, d) for d in dims]
             ),
-            "local_exe": local_exe if local_exe.get("version") != "unknown" else (notice.get("local_exe") or local_exe),
+            "local_exe": effective_local_exe,
             "pending_updater": pending_updater,
             "latest_versions": dict(notice.get("latest_versions") or (state or {}).get("last_seen_versions") or {}),
             "new_versions": dict(notice.get("new_versions") or {}),
             "models_info": dict(notice.get("models_info") or {}),
             "builtin_diff": dict(notice.get("builtin_diff") or {}),
-            "review_prompt": str(notice.get("review_prompt", "")),
+            "review_prompt": refreshed_prompt,
             "source": "pending_notice",
             "error": refresh_error,
         }
@@ -1576,7 +1720,7 @@ def run_sentinel(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             )
 
         local_exe = get_local_antigravity_version()
-        pending_updater = check_pending_updater_files()
+        pending_updater = check_pending_updater_files(local_version=local_exe["version"])
         current_builtin = builtin_snapshot.collect_snapshot(builtin_dir)
 
         state = load_state(state_path)
@@ -1591,6 +1735,7 @@ def run_sentinel(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 "models_section_hash": models_info["hash"],
                 "models_section_text": models_info["text"],
                 "local_exe_version": local_exe["version"],
+                "last_seen_pending_version": str(pending_updater.get("pending_version") or ""),
                 "last_checked_at": now_iso,
                 "audit_history": state.get("audit_history", []) if state else [],
                 "updated_at": now_iso,
@@ -1641,8 +1786,13 @@ def run_sentinel(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 "current_file_count": current_builtin["file_count"],
             }
 
+        pending_ver = str(pending_updater.get("pending_version") or "")
+        pending_installer_changed = _is_pending_installer_unseen(pending_updater, state)
         has_any_change = bool(
-            new_versions or models_changed or builtin_diff.get("has_changes")
+            new_versions
+            or models_changed
+            or builtin_diff.get("has_changes")
+            or pending_installer_changed
         )
         if not has_any_change and not getattr(args, "audit_latest", False):
             if not getattr(args, "dry_run", False) and state is not None:
@@ -1670,12 +1820,20 @@ def run_sentinel(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             models_info.get("deprecation_notices", []),
             builtin_diff,
         )
+        if (
+            pending_installer_changed
+            and not (new_versions.get("Antigravity App") or [])
+            and prescreen["verdict"] == "SAFE"
+        ):
+            prescreen["verdict"] = "CAUTION"
+            prescreen["fallback_headline"] = f"本地已下载待安装更新包 v{pending_ver}"[:36]
         run_id = str(uuid.uuid4())
         version_label = _build_version_label(
             new_versions,
             parsed_changelog,
             models_changed,
             bool(builtin_diff.get("has_changes")),
+            pending_installer_version=pending_ver if pending_installer_changed else "",
         )
         initial_annotations = map_title_and_annotations(
             prescreen["verdict"], version_label, prescreen["fallback_headline"]

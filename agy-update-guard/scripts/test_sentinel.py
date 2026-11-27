@@ -507,12 +507,25 @@ RISK_DIMENSIONS: permission_sandbox, telemetry_upload
                 {"last_checked_at": now_iso, "last_seen_versions": {"Antigravity App": "2.35.1"}},
             )
             spawn_calls: list[tuple] = []
+            no_pending = {
+                "has_pending": False,
+                "updater_dir": "",
+                "files": [],
+                "file_versions": {},
+                "pending_version": "",
+                "has_newer_pending": False,
+            }
             with mock.patch.object(
                 session_hook.subprocess,
                 "Popen",
                 side_effect=lambda *a, **kw: spawn_calls.append((a, kw)),
             ):
-                empty_out = session_hook.build_hook_output(data_dir, spawn_check=True)
+                empty_out = session_hook.build_hook_output(
+                    data_dir,
+                    spawn_check=True,
+                    local_exe={"path": "", "version": "2.35.1"},
+                    pending_updater=no_pending,
+                )
                 self.assertEqual(empty_out, {})
                 self.assertEqual(len(spawn_calls), 0)
 
@@ -543,7 +556,12 @@ RISK_DIMENSIONS: permission_sandbox, telemetry_upload
                 "Popen",
                 side_effect=lambda *a, **kw: spawn_calls.append((a, kw)),
             ):
-                hook_out = session_hook.build_hook_output(data_dir, spawn_check=True)
+                hook_out = session_hook.build_hook_output(
+                    data_dir,
+                    spawn_check=True,
+                    local_exe={"path": "", "version": "2.35.1"},
+                    pending_updater=no_pending,
+                )
 
             self.assertEqual(len(spawn_calls), 1)
             self.assertTrue((data_dir / "check.lock").exists())
@@ -562,7 +580,12 @@ RISK_DIMENSIONS: permission_sandbox, telemetry_upload
                 json.dumps({"notice_id": "n-1", "acknowledged": True}),
                 encoding="utf-8",
             )
-            ack_out = session_hook.build_hook_output(data_dir, spawn_check=False)
+            ack_out = session_hook.build_hook_output(
+                data_dir,
+                spawn_check=False,
+                local_exe={"path": "", "version": "2.35.1"},
+                pending_updater=no_pending,
+            )
             self.assertEqual(ack_out, {})
 
     def test_10_mcp_server_e2e_protocol(self) -> None:
@@ -860,6 +883,336 @@ RISK_DIMENSIONS: permission_sandbox, telemetry_upload
             cmd = captured["cmd"]
             self.assertEqual(cmd[:2], [str(fake_exe), "agentapi"])
             self.assertEqual(cmd[-1], multiline_prompt)
+
+    def test_15_acknowledge_and_cached_prompt_use_live_local_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            builtin_dir = Path(tmp) / "builtin"
+            builtin_dir.mkdir()
+            (builtin_dir / "SKILL.md").write_text("baseline\n", encoding="utf-8")
+
+            stale_prompt = (
+                "Audit-Run-ID: old-run-1\n\n"
+                "## 本机客户端环境\n"
+                "- 本机 Antigravity.exe 版本: `2.35.1` (`C:\\Old\\Antigravity.exe`)\n"
+                "- 本地更新缓存 (`antigravity-updater`): 未检测到待安装 `.exe` 文件。\n\n"
+                "## 本地预检命中情况\n"
+                "- 预检级别: `SAFE`\n"
+            )
+            sentinel.save_state(
+                data_dir / "state.json",
+                {
+                    "last_seen_versions": {"Antigravity App": "2.35.1"},
+                    "local_exe_version": "2.35.1",
+                    "last_checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                },
+            )
+            (data_dir / "pending_notice.json").write_text(
+                json.dumps(
+                    {
+                        "notice_id": "old-run-1",
+                        "created_at": "2026-11-26T04:15:00+00:00",
+                        "acknowledged": False,
+                        "version_label": "App v2.35.2",
+                        "verdict": "SAFE",
+                        "headline": "常规修复",
+                        "local_exe": {"path": "C:\\Old\\Antigravity.exe", "version": "2.35.1"},
+                        "latest_versions": {"Antigravity App": "2.35.2"},
+                        "review_prompt": stale_prompt,
+                        "pending_baseline": {
+                            "last_seen_versions": {"Antigravity App": "2.35.2"},
+                            "local_exe_version": "2.35.1",
+                            "pending_updater_version": "2.35.2",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            live_exe = {"path": "C:\\Live\\Antigravity.exe", "version": "2.35.2"}
+            live_pending = {
+                "has_pending": True,
+                "updater_dir": "C:\\Live\\antigravity-updater",
+                "files": ["installer.exe", "pending/Antigravity-x64.exe"],
+                "file_versions": {
+                    "installer.exe": "2.35.2",
+                    "pending/Antigravity-x64.exe": "2.36.0",
+                },
+                "pending_version": "2.36.0",
+                "has_newer_pending": True,
+            }
+            with (
+                mock.patch.object(sentinel, "get_local_antigravity_version", return_value=live_exe),
+                mock.patch.object(sentinel, "check_pending_updater_files", return_value=live_pending),
+            ):
+                sc = sentinel.collect_guard_structured_content(
+                    data_dir=data_dir,
+                    refresh=False,
+                    builtin_dir=builtin_dir,
+                )
+                self.assertEqual(sc["local_exe"]["version"], "2.35.2")
+                self.assertIn("`2.35.2`", sc["review_prompt"])
+                self.assertNotIn("`2.35.1`", sc["review_prompt"])
+                self.assertIn("pending/Antigravity-x64.exe (v2.36.0)", sc["review_prompt"])
+
+                sentinel.acknowledge_pending_notice(data_dir=data_dir, builtin_dir=builtin_dir)
+                saved_state = sentinel.load_state(data_dir / "state.json")
+                assert saved_state is not None
+                self.assertEqual(saved_state["local_exe_version"], "2.35.2")
+
+    def test_16_session_hook_alerts_and_bypasses_cooldown_on_newer_pending_installer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+            sentinel.save_state(
+                data_dir / "state.json",
+                {
+                    "last_checked_at": now_iso,
+                    "last_seen_versions": {"Antigravity App": "2.35.2"},
+                    "local_exe_version": "2.35.2",
+                    "last_seen_pending_version": "2.35.2",
+                },
+            )
+            (data_dir / "pending_notice.json").write_text(
+                json.dumps(
+                    {
+                        "notice_id": "old-2352",
+                        "acknowledged": True,
+                        "latest_versions": {"Antigravity App": "2.35.2"},
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            live_exe = {"path": "C:\\Live\\Antigravity.exe", "version": "2.35.2"}
+            newer_pending = {
+                "has_pending": True,
+                "updater_dir": "C:\\Live\\antigravity-updater",
+                "files": ["installer.exe", "pending/Antigravity-x64.exe"],
+                "file_versions": {
+                    "installer.exe": "2.35.2",
+                    "pending/Antigravity-x64.exe": "2.36.0",
+                },
+                "pending_version": "2.36.0",
+                "has_newer_pending": True,
+            }
+
+            spawn_calls: list[tuple] = []
+            with mock.patch.object(
+                session_hook.subprocess,
+                "Popen",
+                side_effect=lambda *a, **kw: spawn_calls.append((a, kw)),
+            ):
+                out = session_hook.build_hook_output(
+                    data_dir,
+                    spawn_check=True,
+                    local_exe=live_exe,
+                    pending_updater=newer_pending,
+                )
+
+            # Even within 4h cooldown, newer pending installer forces background check and alerts immediately
+            self.assertEqual(len(spawn_calls), 1)
+            md = out["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"]
+            self.assertIn("App v2.36.0", md)
+            self.assertIn("v2.35.2", md)
+            self.assertIn("pending/Antigravity-x64.exe (v2.36.0)", md)
+
+            # Once acknowledged in state.json for 2.36.0, no duplicate pending alert
+            sentinel.save_state(
+                data_dir / "state.json",
+                {
+                    "last_checked_at": now_iso,
+                    "last_seen_versions": {"Antigravity App": "2.35.2"},
+                    "local_exe_version": "2.35.2",
+                    "last_seen_pending_version": "2.36.0",
+                },
+            )
+            ack_out = session_hook.build_hook_output(
+                data_dir,
+                spawn_check=False,
+                local_exe=live_exe,
+                pending_updater=newer_pending,
+            )
+            self.assertEqual(ack_out, {})
+
+    def test_17_sentinel_check_triggers_notice_on_newer_pending_installer_without_changelog_bump(self) -> None:
+        _MockHTTPHandler.routes = {
+            "/changelog.md": SAMPLE_CHANGELOG_V2,
+            "/models.md": SAMPLE_MODELS_V1,
+        }
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _MockHTTPHandler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                data_dir = Path(tmp) / "data"
+                builtin_dir = Path(tmp) / "builtin"
+                builtin_dir.mkdir()
+                (builtin_dir / "SKILL.md").write_text("baseline\n", encoding="utf-8")
+
+                no_pending = {
+                    "has_pending": False,
+                    "updater_dir": "",
+                    "files": [],
+                    "file_versions": {},
+                    "pending_version": "",
+                    "has_newer_pending": False,
+                }
+                live_exe = {"path": "C:\\Live\\Antigravity.exe", "version": "2.36.0"}
+
+                with (
+                    mock.patch.object(sentinel, "get_local_antigravity_version", return_value=live_exe),
+                    mock.patch.object(sentinel, "check_pending_updater_files", return_value=no_pending),
+                ):
+                    code, _ = sentinel.run_sentinel(
+                        argparse.Namespace(
+                            check=False,
+                            init_baseline=True,
+                            acknowledge=False,
+                            audit_latest=False,
+                            dry_run=False,
+                            manual_create_conversation=False,
+                            data_dir=str(data_dir),
+                            builtin_dir=str(builtin_dir),
+                            changelog_url=f"http://127.0.0.1:{port}/changelog.md",
+                            models_url=f"http://127.0.0.1:{port}/models.md",
+                            model=None,
+                            wait_seconds=5,
+                        )
+                    )
+                    self.assertEqual(code, 0)
+
+                newer_pending = {
+                    "has_pending": True,
+                    "updater_dir": "C:\\Live\\antigravity-updater",
+                    "files": ["pending/Antigravity-x64.exe"],
+                    "file_versions": {"pending/Antigravity-x64.exe": "2.37.0"},
+                    "pending_version": "2.37.0",
+                    "has_newer_pending": True,
+                }
+                with (
+                    mock.patch.object(sentinel, "get_local_antigravity_version", return_value=live_exe),
+                    mock.patch.object(sentinel, "check_pending_updater_files", return_value=newer_pending),
+                ):
+                    code, res = sentinel.run_sentinel(
+                        argparse.Namespace(
+                            check=True,
+                            init_baseline=False,
+                            acknowledge=False,
+                            audit_latest=False,
+                            dry_run=False,
+                            manual_create_conversation=False,
+                            data_dir=str(data_dir),
+                            builtin_dir=str(builtin_dir),
+                            changelog_url=f"http://127.0.0.1:{port}/changelog.md",
+                            models_url=f"http://127.0.0.1:{port}/models.md",
+                            model=None,
+                            wait_seconds=5,
+                        )
+                    )
+                self.assertEqual(code, 0)
+                self.assertEqual(res["status"], "pending_notice")
+                self.assertTrue(res["notice_written"])
+                self.assertIn("2.37.0", res["version_label"])
+                self.assertEqual(res["verdict"], "CAUTION")
+
+                # If state already acknowledged App 2.37.0 (even with empty last_seen_pending_version),
+                # sentinel --check should stay consistent with session_hook and not re-alert.
+                sentinel.save_state(
+                    data_dir / "state.json",
+                    {
+                        "last_seen_versions": {
+                            "Antigravity App": "2.37.0",
+                            "Antigravity CLI": "1.5.16",
+                            "Antigravity IDE": "2.8.0",
+                        },
+                        "models_section_hash": sentinel.extract_reasoning_models_section(SAMPLE_MODELS_V1)["hash"],
+                        "models_section_text": sentinel.extract_reasoning_models_section(SAMPLE_MODELS_V1)["text"],
+                        "local_exe_version": "2.36.0",
+                        "last_seen_pending_version": "",
+                        "last_checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    },
+                )
+                with (
+                    mock.patch.object(sentinel, "get_local_antigravity_version", return_value=live_exe),
+                    mock.patch.object(sentinel, "check_pending_updater_files", return_value=newer_pending),
+                ):
+                    code2, res2 = sentinel.run_sentinel(
+                        argparse.Namespace(
+                            check=True,
+                            init_baseline=False,
+                            acknowledge=False,
+                            audit_latest=False,
+                            dry_run=False,
+                            manual_create_conversation=False,
+                            data_dir=str(data_dir),
+                            builtin_dir=str(builtin_dir),
+                            changelog_url=f"http://127.0.0.1:{port}/changelog.md",
+                            models_url=f"http://127.0.0.1:{port}/models.md",
+                            model=None,
+                            wait_seconds=5,
+                        )
+                    )
+                self.assertEqual(code2, 0)
+                self.assertEqual(res2["status"], "no_changes")
+                self.assertFalse(res2["notice_written"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_18_check_pending_updater_files_and_mixed_product_label(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            upd_dir = Path(tmp) / "antigravity-updater"
+            pending_dir = upd_dir / "pending"
+            pending_dir.mkdir(parents=True)
+            root_exe = upd_dir / "installer.exe"
+            old_pending = pending_dir / "old.exe"
+            new_pending = pending_dir / "Antigravity-x64.exe"
+            root_exe.write_bytes(b"stub")
+            old_pending.write_bytes(b"stub")
+            new_pending.write_bytes(b"stub")
+
+            ver_map = {
+                root_exe.resolve(): "2.35.2",
+                old_pending.resolve(): "2.35.3",
+                new_pending.resolve(): "2.36.0",
+            }
+
+            with mock.patch.object(
+                sentinel,
+                "_read_pe_version_ctypes",
+                side_effect=lambda p: ver_map.get(Path(p).resolve(), "unknown"),
+            ):
+                res_newer = sentinel.check_pending_updater_files(
+                    updater_dir=upd_dir, local_version="2.35.2"
+                )
+                self.assertTrue(res_newer["has_pending"])
+                self.assertEqual(res_newer["pending_version"], "2.36.0")
+                self.assertTrue(res_newer["has_newer_pending"])
+                self.assertEqual(
+                    res_newer["file_versions"]["pending/Antigravity-x64.exe"], "2.36.0"
+                )
+                self.assertEqual(res_newer["file_versions"]["installer.exe"], "2.35.2")
+
+                res_same = sentinel.check_pending_updater_files(
+                    updater_dir=upd_dir, local_version="2.36.0"
+                )
+                self.assertEqual(res_same["pending_version"], "2.36.0")
+                self.assertFalse(res_same["has_newer_pending"])
+
+        # Mixed case: CLI has a new version while App only has a local pending installer
+        label = sentinel._build_version_label(
+            new_versions={"Antigravity CLI": [{"tag": "v1.5.17", "version": "1.5.17"}]},
+            parsed_changelog={},
+            models_changed=False,
+            builtin_changed=False,
+            pending_installer_version="2.36.0",
+        )
+        self.assertIn("App v2.36.0 (本地待安装)", label)
+        self.assertIn("CLI v1.5.17", label)
 
 
 if __name__ == "__main__":
