@@ -28,6 +28,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import builtin_snapshot  # noqa: E402
 import local_inspector  # noqa: E402
+import snapshot_manager  # noqa: E402
 import update_blocker  # noqa: E402
 
 CHANGELOG_URL = "https://antigravity.google/docs/changelog.md"
@@ -1559,6 +1560,7 @@ def collect_guard_structured_content(
     local_exe = get_local_antigravity_version()
     pending_updater = check_pending_updater_files(local_version=local_exe["version"])
     update_lock = update_blocker.get_update_lock_status(data_dir=resolved_data)
+    snapshots = snapshot_manager.list_snapshots(resolved_data)
 
     should_refresh = refresh or (state is None and notice is None)
     refresh_error = ""
@@ -1714,6 +1716,7 @@ def collect_guard_structured_content(
                     "local_exe": local_exe,
                     "pending_updater": pending_updater,
                     "update_lock": update_lock,
+                    "snapshots": snapshots,
                     "local_probe": local_probe,
                     "latest_versions": latest_versions,
                     "new_versions": notice["new_versions"],
@@ -1743,6 +1746,7 @@ def collect_guard_structured_content(
                 "local_exe": local_exe,
                 "pending_updater": pending_updater,
                 "update_lock": update_lock,
+                "snapshots": snapshots,
                 "local_probe": local_probe,
                 "latest_versions": latest_versions,
                 "new_versions": _compact_new_versions(display_versions),
@@ -1809,6 +1813,7 @@ def collect_guard_structured_content(
             "local_exe": effective_local_exe,
             "pending_updater": pending_updater,
             "update_lock": update_lock,
+            "snapshots": snapshots,
             "local_probe": effective_probe,
             "latest_versions": dict(notice.get("latest_versions") or (state or {}).get("last_seen_versions") or {}),
             "new_versions": dict(notice.get("new_versions") or {}),
@@ -1891,6 +1896,7 @@ def collect_guard_structured_content(
         "local_exe": local_exe,
         "pending_updater": pending_updater,
         "update_lock": update_lock,
+        "snapshots": snapshots,
         "local_probe": fallback_probe,
         "latest_versions": cached_versions,
         "new_versions": {},
@@ -1923,6 +1929,31 @@ def run_sentinel(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         else builtin_snapshot.get_default_builtin_dir()
     )
 
+    if getattr(args, "save_snapshot", False):
+        snap_res = snapshot_manager.create_portable_snapshot(
+            data_dir=data_dir,
+            export_path=getattr(args, "export_path", None),
+            plugin_root=PLUGIN_ROOT,
+        )
+        return 0, {"mode": "save_snapshot", **snap_res}
+    if getattr(args, "list_snapshots", False):
+        return 0, {"mode": "list_snapshots", "snapshots": snapshot_manager.list_snapshots(data_dir)}
+    if getattr(args, "rollback", None):
+        target_arg = str(args.rollback).strip()
+        cand_path = Path(target_arg)
+        if not cand_path.is_file():
+            snaps = snapshot_manager.list_snapshots(data_dir)
+            matched = [
+                s for s in snaps
+                if target_arg in (s["version"], f"v{s['version']}", s["file_name"])
+            ]
+            if not matched and target_arg.lower() == "latest" and snaps:
+                matched = [snaps[0]]
+            if not matched:
+                raise FileNotFoundError(f"未找到匹配的本地快照: {target_arg}")
+            cand_path = Path(matched[0]["path"])
+        rb_res = snapshot_manager.restore_from_snapshot_zip(cand_path, data_dir=data_dir)
+        return 0, {"mode": "rollback", **rb_res}
     if getattr(args, "lock_updates", False):
         return 0, {"mode": "lock_updates", **update_blocker.lock_updates(data_dir)}
     if getattr(args, "unlock_updates", False):
@@ -2274,6 +2305,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--unlock-updates",
         action="store_true",
         help="Restore auto-update manifest, setting, and UI update button.",
+    )
+    parser.add_argument(
+        "--save-snapshot",
+        action="store_true",
+        help="Create a cross-machine portable .zip snapshot of the current client & patches.",
+    )
+    parser.add_argument(
+        "--export",
+        dest="export_path",
+        default=None,
+        help="Optional target .zip file or directory when used with --save-snapshot.",
+    )
+    parser.add_argument(
+        "--list-snapshots",
+        action="store_true",
+        help="List saved portable client snapshots.",
+    )
+    parser.add_argument(
+        "--rollback",
+        default=None,
+        metavar="ZIP_OR_VER",
+        help="Restore local client from a snapshot .zip, version (e.g. 2.35.2), or 'latest' (requires app closed).",
     )
     parser.add_argument(
         "--audit-latest",

@@ -9,11 +9,13 @@ import http.server
 import io
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -30,6 +32,7 @@ import local_inspector  # noqa: E402
 import mcp_server  # noqa: E402
 import sentinel  # noqa: E402
 import session_hook  # noqa: E402
+import snapshot_manager  # noqa: E402
 import update_blocker  # noqa: E402
 
 
@@ -1689,6 +1692,150 @@ RISK_DIMENSIONS: permission_sandbox, telemetry_upload
             self.assertEqual(
                 (app_dir / "resources" / "app-update.yml").read_text(encoding="utf-8"),
                 orig_yml,
+            )
+
+    def test_22_portable_snapshot_create_list_and_restore_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data"
+            app_dir = root / "app"
+            ce_src = root / "chat_editor_src"
+            export_dir = root / "exported"
+
+            # Build a valid synthetic ASAR containing a hardcoded username path + unpacked node entry
+            header = {
+                "files": {
+                    "package.json": {"offset": "0", "size": 0},
+                    "dist": {
+                        "files": {
+                            "main.js": {"offset": "0", "size": 0},
+                        }
+                    },
+                    "node_modules": {"unpacked": True},
+                }
+            }
+            pkg_bytes = b'{"name":"antigravity","version":"2.35.2"}'
+            hardcoded_main = (
+                b'console.log("boot");\n// AGY_CHAT_EDITOR_V1\n'
+                b'try { require("C:\\\\Users\\\\alice\\\\AppData\\\\Local\\\\AntigravityChatEditor\\\\main.cjs")'
+                b".start(require('./languageServer')); } catch (e) {}\n"
+            )
+            asar_bytes = snapshot_manager.repack_asar(
+                header,
+                {"package.json": pkg_bytes, "dist/main.js": hardcoded_main},
+                {"package.json", "dist/main.js"},
+            )
+
+            (app_dir / "resources" / "bin").mkdir(parents=True)
+            (app_dir / "Antigravity.exe").write_bytes(b"MZ-exe-2352")
+            (app_dir / "resources" / "app.asar").write_bytes(asar_bytes)
+            (app_dir / "resources" / "app-update.yml").write_text(
+                "provider: generic\nurl: https://example.com/manifest/\nupdaterCacheDirName: antigravity-updater\n",
+                encoding="utf-8",
+            )
+            embedded_buf = io.BytesIO()
+            with zipfile.ZipFile(embedded_buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as ezf:
+                ezf.writestr(
+                    "main.js",
+                    ("x" * 200) + 'conversationForkingEnabled:typeof window.dialog?.showOpenDialog==="function"',
+                )
+            (app_dir / "resources" / "bin" / "language_server.exe").write_bytes(
+                b"MZ-ls-header-" + embedded_buf.getvalue()
+            )
+            # Corrupted trailing PK\x05\x06 signature or unpatched binary returns False safely without raising
+            corrupted_zip = b"PK\x03\x04" + b"\x00" * 30 + b"PK\x05\x06" + struct.pack("<HHHHIIH", 0, 0, 1, 1, 10, 24, 0)
+            self.assertFalse(snapshot_manager._detect_fork_patched_in_ls(corrupted_zip))
+
+            # Chat editor runtime with private .local/edits.json that MUST NOT be leaked into portable zip
+            (ce_src / ".local").mkdir(parents=True)
+            (ce_src / "main.cjs").write_text("// main runtime\n", encoding="utf-8")
+            (ce_src / "renderer.js").write_text("// renderer bundle\n", encoding="utf-8")
+            (ce_src / ".local" / "edits.json").write_text('[{"secret":"private"}]\n', encoding="utf-8")
+
+            snap = snapshot_manager.create_portable_snapshot(
+                data_dir=data_dir,
+                app_dir=app_dir,
+                chat_editor_dir=ce_src,
+                plugin_root=PLUGIN_ROOT,
+            )
+            self.assertTrue(snap["created"])
+            self.assertEqual(snap["version"], "2.35.2")
+            self.assertTrue(snap["asar_portable_rewritten"])
+            self.assertTrue(snap["fork_patched"])
+            self.assertTrue(snap["chat_editor_bundled"])
+            self.assertTrue(snap["update_guard_bundled"])
+
+            listed = snapshot_manager.list_snapshots(data_dir)
+            self.assertEqual(len(listed), 1)
+            self.assertEqual(listed[0]["version"], "2.35.2")
+
+            # Also verify --export to custom directory works and also retains a copy in client_snapshots
+            export_only_data = root / "export_only_data"
+            export_only_data.mkdir(parents=True)
+            (export_only_data / "companion_paths.json").write_text(
+                json.dumps({"chat_editor_dir": str(ce_src)}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            # Ensure companion fallback works when chat_editor_dir is omitted and install.py exists
+            (ce_src / "install.py").write_text("# stub\n", encoding="utf-8")
+            exported = snapshot_manager.create_portable_snapshot(
+                data_dir=export_only_data,
+                export_path=export_dir,
+                app_dir=app_dir,
+                chat_editor_dir=None,
+                plugin_root=root / "isolated_plugin",
+            )
+            exp_zip = Path(exported["snapshot_path"])
+            self.assertTrue(exp_zip.is_file())
+            self.assertTrue(exported["chat_editor_bundled"])
+            self.assertEqual(len(snapshot_manager.list_snapshots(export_only_data)), 1)
+
+            with zipfile.ZipFile(exp_zip, "r") as zf:
+                names = set(zf.namelist())
+                self.assertIn("部署到此电脑.cmd", names)
+                self.assertIn("restore_snapshot.ps1", names)
+                self.assertIn("app/resources/app-update.yml.official", names)
+                self.assertIn("AntigravityChatEditor/main.cjs", names)
+                self.assertFalse(any(".local" in n for n in names))
+                packed_hdr, packed_entries = snapshot_manager.unpack_asar(
+                    zf.read("app/resources/app.asar")
+                )
+                rewritten_js = packed_entries["dist/main.js"].decode("utf-8")
+                self.assertNotIn("alice", rewritten_js)
+                self.assertIn("process.env.LOCALAPPDATA", rewritten_js)
+                self.assertTrue(packed_hdr["files"]["node_modules"]["unpacked"])
+
+            # Simulate upgrading/corrupting target machine then rolling back from portable zip
+            target_app = root / "restored_machine" / "Programs" / "antigravity"
+            target_ce = root / "restored_machine" / "AntigravityChatEditor"
+            target_app.mkdir(parents=True)
+            (target_app / "Antigravity.exe").write_bytes(b"broken-2360")
+            (target_ce / ".local").mkdir(parents=True)
+            (target_ce / ".local" / "edits.json").write_text('[{"keep":"existing"}]\n', encoding="utf-8")
+
+            restored_data = root / "restored_data"
+            restored = snapshot_manager.restore_from_snapshot_zip(
+                exp_zip,
+                data_dir=restored_data,
+                app_dir=target_app,
+                chat_editor_target_dir=target_ce,
+                lock_after_restore=True,
+                check_running=False,
+            )
+            self.assertTrue(restored["restored"])
+            self.assertEqual(restored["version"], "2.35.2")
+            self.assertEqual((target_app / "Antigravity.exe").read_bytes(), b"MZ-exe-2352")
+            self.assertTrue((target_ce / "main.cjs").is_file())
+            # Existing local edits on target machine are preserved
+            self.assertIn("keep", (target_ce / ".local" / "edits.json").read_text(encoding="utf-8"))
+            # Fresh restored machine can cleanly unlock_updates back to official app-update.yml
+            unlocked_after_rb = update_blocker.unlock_updates(
+                data_dir=restored_data, app_dir=target_app
+            )
+            self.assertFalse(unlocked_after_rb["manifest_blocked"])
+            self.assertIn(
+                "https://example.com/manifest/",
+                (target_app / "resources" / "app-update.yml").read_text(encoding="utf-8"),
             )
 
 

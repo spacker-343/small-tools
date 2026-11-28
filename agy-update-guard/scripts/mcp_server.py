@@ -22,6 +22,7 @@ for _p in (SCRIPTS_DIR, SENTINEL_DIR):
         sys.path.insert(0, str(_p))
 
 import sentinel  # noqa: E402
+import snapshot_manager  # noqa: E402
 import update_blocker  # noqa: E402
 
 
@@ -162,6 +163,22 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     }
                 },
                 "required": ["locked"],
+                "additionalProperties": False,
+            },
+            "_meta": {
+                "ui": {"visibility": ["app"]},
+            },
+        },
+        {
+            "name": "app_save_snapshot",
+            "title": "Save Portable Client Snapshot",
+            "description": (
+                "App-only tool to pack the current Antigravity client, Fork/Edit patches, and deploy script "
+                "into a cross-machine portable .zip snapshot."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
                 "additionalProperties": False,
             },
             "_meta": {
@@ -378,6 +395,30 @@ class UpdateGuardMcpServer:
             action_txt = "已锁定自动更新并清理本地安装包" if want_locked else "已解除自动更新锁定"
             return {
                 "content": [{"type": "text", "text": f"{action_txt}。\n{_format_text_summary(payload)}"}],
+                "structuredContent": payload,
+            }
+
+        if name == "app_save_snapshot":
+            snap = snapshot_manager.create_portable_snapshot(
+                data_dir=self.data_dir,
+                plugin_root=PLUGIN_ROOT,
+            )
+            payload = sentinel.collect_guard_structured_content(
+                data_dir=self.data_dir,
+                refresh=False,
+                include_latest=True,
+                changelog_url=self.changelog_url,
+                models_url=self.models_url,
+                builtin_dir=self.builtin_dir,
+            )
+            payload["last_saved_snapshot"] = snap
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"已保存便携快照：{snap['snapshot_path']} ({snap['size_mb']} MB)",
+                    }
+                ],
                 "structuredContent": payload,
             }
 

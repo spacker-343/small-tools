@@ -55,6 +55,10 @@
 | `python sentinel.py --acknowledge` | 将 `pending_notice.json` 标记为已读，并同步推进 `state.json` 与基线快照 |
 | `python sentinel.py --dry-run --audit-latest` | 只读预检，输出完整采集信息与评估 Prompt，不写状态文件 |
 | `python sentinel.py --dry-run --audit-latest --json` | 以 JSON 格式输出预检结果（`/update-audit` 技能默认使用） |
+| `python sentinel.py --lock-updates` / `--unlock-updates` | 一键清理本地安装包并锁定/恢复自动更新与顶部更新按钮 |
+| `python sentinel.py --save-snapshot [--export <path>]` | 打包当前客户端、Fork/Edit 补丁与免依赖一键部署脚本为跨机便携 `.zip` 快照 |
+| `python sentinel.py --list-snapshots` | 列出已保存的客户端便携快照 |
+| `python sentinel.py --rollback <zip_or_version>` | 退出客户端后一键从快照回滚恢复指定版本并自动锁死更新 |
 | `python sentinel.py --audit-latest --manual-create-conversation` | 仅作命令行手动调试备用，显式通过原生对话通道发起评估 |
 
 常用可选参数：`--data-dir <path>`、`--builtin-dir <path>`、`--model <model_id>`（或环境变量 `AGY_UPDATE_GUARD_MODEL`）、`--wait-seconds <sec>`。
